@@ -25,6 +25,9 @@ coproduct, and content-free `source_anchors`. Completed enrichment includes:
 provider = mistral
 model
 prompt_version
+disclosure_scope
+authorization_policy_digest
+prompt_digest
 schema_version
 episodes
 entities
@@ -32,22 +35,59 @@ claims with confidence, epistemic_status, and citations
 relations with confidence, epistemic_status, and citations
 ```
 
+The list contract is:
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "019d2a40-7324-77a2-832c-f5f9f84473b0",
+      "display": {
+        "source": "deterministic_fallback",
+        "title": "...",
+        "summary": "..."
+      },
+      "outcome": "inconclusive",
+      "activity_count": 0,
+      "enrichment": { "state": "unavailable", "reason": "no_completed_run" }
+    }
+  ]
+}
+```
+
+Detail responses add deterministic `activities`, the completed enrichment
+collections or a typed unavailable reason, and `source_anchors`. Invalid session
+IDs return `400`, missing verified sessions return `404`, and graph-read failures
+return `503`; errors contain only a closed `code` and source-safe `message`.
+
 Each citation contains only `anchor_id`. Its corresponding source anchor contains
 only a display label, closed source kind, record sequence, and content digest.
 It contains no transcript field path, local path, or excerpt.
 
 ## Development
 
+Start the Rust API against the configured Neo4j graph. To use a non-default API
+port, override its bind address explicitly:
+
+```bash
+HARNESS_GRAPH_BIND_ADDRESS=127.0.0.1:3200 \
+  cargo run -p harness-graph-cli -- serve
+```
+
+Then start the UI from this directory with the same credential-free loopback
+origin:
+
 ```bash
 npm install
-npm run dev
+VITE_API_PROXY_TARGET=http://127.0.0.1:3200 npm run dev
 ```
 
 The Vite development server proxies `/v1` and `/health` to the CLI/API default
-`http://127.0.0.1:3000`. Override the target without exposing credentials:
+`http://127.0.0.1:3000` when `VITE_API_PROXY_TARGET` is absent. The UI itself is
+served on `http://127.0.0.1:4173`. For the default API port, use:
 
 ```bash
-VITE_API_PROXY_TARGET=http://127.0.0.1:3200 npm run dev
+npm run dev
 ```
 
 ## Validation
@@ -89,3 +129,8 @@ session, and—when present—a completed enrichment with Mistral provenance and
 resolvable citation. An unavailable API, empty graph, missing fallback, contract
 violation, leaked private field, or unresolved completed-run citation fails with
 a specific diagnostic.
+
+The contract-browser suite and live deterministic API/Neo4j path are proven.
+The composed live browser proof against a paid transcript-enriched graph,
+including the planned graph and assurance panels, remains an open gate in the
+root [`plan.md`](../../plan.md).

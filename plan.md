@@ -1163,9 +1163,12 @@ enrichment.
 
 ### Extraction contract
 
-Mistral is the only foundation-model provider. The implementation reads the exact
-`MISTRAL_API_KEY` from the project environment, validates that `MISTRAL_MODEL` is
-a Mistral-hosted non-Labs model, and uses Rig only inside the infrastructure
+Mistral is the only foundation-model provider. Cost-bearing transcript apply
+reads only the exact canonical `MISTRAL_API_KEY` from the repository-root `.env`;
+an inherited process value or the historical `MISTARL_API_KEY` alias cannot
+select a different account. The transcript adapter requires
+`MISTRAL_TRANSCRIPT_MODEL=mistral-small-2603`, uses the stateless regional EU
+endpoint `https://api.eu.mistral.ai`, and keeps Rig inside the infrastructure
 adapter. Transcript text is quoted as untrusted evidence, never interpreted as
 instructions; the request exposes no tools and accepts only native JSON-schema
 structured output.
@@ -1200,8 +1203,9 @@ presentation is aggregated deterministically from their cited episodes; this
 local composition incurs no additional provider call. A foundation-model session
 reducer is explicitly deferred until it has its own durable fingerprint,
 checkpoint, and receipt so retries cannot replay an uncheckpointed paid call.
-Classification and transcript extraction run concurrently when independent, but
-projection waits for both required branches to settle.
+Each chunk's single structured call jointly classifies closed knowledge kinds and
+extracts episodes, entities, claims, and relations. Projection waits for every
+required chunk branch to settle and validate.
 
 The enrichment fingerprint is content-addressed from:
 
@@ -1217,11 +1221,14 @@ namespace
 + output schema version
 ```
 
-An exact completed fingerprint is a no-op. Chunk receipts allow retry to resume
-without repeating validated cost-bearing calls. Only typed transient `429`, `5xx`,
-timeout, or transport failures retry with bounded backoff and `Retry-After`;
-privacy, checksum, scanner, schema, citation, secret-echo, or model-family
-failures stop closed.
+An exact completed fingerprint is a no-op. Before each missing chunk can reach
+Mistral, Neo4j must atomically grant a 15-minute owner-bound paid-call lease.
+Committed chunk receipts allow retry to resume without repeating validated
+cost-bearing calls; a busy lease permits no provider call, a failed owner may
+release only its lease, and an expired lease is reclaimable. Only typed transient
+`429`, `5xx`, timeout, or transport failures retry with bounded backoff and
+`Retry-After`; privacy, checksum, scanner, schema, citation, secret-echo, or
+model-family failures stop closed.
 
 ### Privacy and provider mode
 
@@ -1232,16 +1239,27 @@ session counts, redaction-category counts, chunk/token estimates, expected API
 calls, and cost estimate—never text, paths, or credentials.
 
 The initial implementation uses stateless Mistral chat completions through the EU
-regional endpoint and verifies the account's training/retention controls before
-the first real raw-transcript call. It does not use Files, Agents, Conversations,
-feedback APIs, or stateful Batch processing. Batch may be evaluated only as a
-later explicit data-governance decision because the EU regional endpoint does not
-provide the stateful Batch/Files APIs.
+regional endpoint and requires the operator attestation
+`HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL=training_opt_out_verified` before the first
+real raw-transcript call. The CLI does not infer or query account privacy state.
+It also requires one stable, dedicated 32-byte-or-longer
+`HARNESS_GRAPH_REDACTION_HMAC_KEY`, distinct from all provider/database
+credentials and preferably injected from 1Password with `op run`. It does not
+use Files, Agents, Conversations, feedback APIs, or stateful Batch processing.
+Batch may be evaluated only as a later explicit data-governance decision because
+the EU regional endpoint does not provide the stateful Batch/Files APIs.
+
+The committed estimator snapshot is $0.165 per million input tokens and $0.66
+per million output tokens (165,000 and 660,000 micro-USD per million). Pricing
+must be reconfirmed before a paid backfill.
 
 No request/response-body logging is allowed. Provider errors are wrapped before
-they can echo request content. The persisted run records only model/version
-metadata, token/cost usage, timestamps, status, source/chunk counts, redaction
-category counts, and citation-safe semantic output.
+they can echo request content. The persisted run stores source/fingerprint,
+provider/model/version, disclosure/authorization/prompt provenance, lifecycle,
+and expected chunk count. Per-chunk receipts store output digests and token usage;
+the CLI derives cost from those completed checkpoints and the configured pricing
+snapshot. Neo4j stores citation-safe semantic output and content-free span
+anchors, never raw or sanitized transcript text.
 
 ---
 
@@ -1893,6 +1911,15 @@ E2E gate: a real verified archive scan proves checksums, scope selection, bounde
 memory, source-safe reporting, and zero Mistral/Neo4j writes. Commit and push this
 milestone only after the focused tests and E2E pass.
 
+Implemented evidence (commits `28c4b91` and `82805b9`, 2026-07-18): the release
+all-scope dry run covered all 1,369 verified sessions in 78.8 seconds with a
+measured peak near 127.8 MB. It classified 867 sessions as eligible, 10 as
+metadata-only, and 492 as scanner-blocked, while verifying 2,410,017 records.
+The eligible estimate was 9,419 calls, 60,236,474 input tokens, 9,645,056 output
+tokens, and 16,305,624 micro-USD (about $16.31). It reported exactly zero external
+provider calls and zero Neo4j writes. Scanner blocks were 327 non-text-control,
+26 asset/binary, and 139 suspicious-encoded-blob cases.
+
 ### Milestone 3A.1: typed transcript extraction
 
 Deliver:
@@ -1910,6 +1937,11 @@ E2E gate: real temporary copies of captured source-safe records cover ordinary,
 multi-turn, multi-agent, tool, command, patch, error, Unicode, huge-field, and
 prompt-injection cases without using `transcript.md` as semantic input. Commit
 and push only after focused tests and E2E pass.
+
+Implemented evidence (commits `e0746ee` and `97fe028`, 2026-07-18): the typed
+canonical extractor, provenance-retaining local preparation boundary, bounded
+UTF-8 chunker, and opaque citation tokens pass their source-safe fixture and
+full-process dry-run coverage. `transcript.md` is not a semantic input.
 
 ### Milestone 3A.2: mandatory local redaction
 
@@ -1929,6 +1961,14 @@ phones, IPs, home paths, user/customer identifiers, and high-entropy assignments
 are absent from approved chunks, logs, CLI output, errors, and every Neo4j string
 property. Scanner failure blocks the session. Commit and push only after focused
 tests and E2E pass.
+
+Implemented evidence (2026-07-18): the all-scope local scan recorded 927
+known-secret, 165 private-key, 1,846 authentication-material, 3,580
+credential-URL, 351 provider-token, 2,682 high-entropy-assignment, 26,586 email,
+399 phone, 20,610 IP-address, and 485,580 home-path redactions. Apply additionally
+rejects a weak HMAC and any HMAC equal to a loaded Mistral or Neo4j credential.
+The composed raw-provider/Neo4j canary proof remains part of the open paid E2E
+gate below.
 
 ### Milestone 3A.3: Mistral structured extraction
 
@@ -1951,6 +1991,14 @@ data, and no request body appears in output or telemetry. A contract-faithful
 local HTTP server separately proves timeout, `429`, `5xx`, malformed-schema, and
 prompt-echo error semantics without mocks. Commit and push only after focused
 tests and E2E pass.
+
+Implemented evidence (commit `c2fb835`, hardened by `a125486`, 2026-07-18): the
+pinned EU/Mistral structured adapter, joint per-chunk classification/extraction,
+global provider admission gate, `Retry-After` handling, secret-echo validation,
+typed usage, and all-results-settle composition pass focused and
+contract-faithful local-server tests. The ignored real-provider transcript apply
+test compiles but has not been executed; this milestone's paid real-Mistral gate
+therefore remains open.
 
 ### Milestone 3A.4: additive Neo4j projection and API
 
@@ -1976,6 +2024,15 @@ base-graph snapshot unchanged, resolves every citation, hides partial runs,
 repeats the identical fingerprint as a no-op, and creates a parallel version
 when model/prompt/schema/redaction/chunking policy changes. Commit and push only
 after focused tests and E2E pass.
+
+Implemented evidence (commits `c2fb835` and `a125486`, 2026-07-18): enrichment
+has separate graph commands, constraints, versioned nodes/edges, content-free
+span anchors, exact authorization/prompt provenance, completed-only selection,
+and deterministic API fallback. Adapter contract coverage proves identical
+fingerprints are no-ops, changed fingerprints remain parallel, failed/partial
+runs do not move selection, and citation cardinalities must reconcile before a
+chunk receipt commits. This does not substitute for the open composed paid
+Mistral + real Neo4j E2E.
 
 ### Milestone 3A.5: pilot, bounded backfill, and enriched UI
 
@@ -2003,6 +2060,24 @@ E2E gate: the real Mistral + real Neo4j full workflow proves resumability,
 idempotency, all-results-settle behavior, stable deterministic counts, no secret
 or raw-text persistence, and deterministic UI fallback. Commit and push only
 after all focused, workspace, security, and E2E checks pass.
+
+Implemented but not rolled out (commits `97f9fd4`, `a125486`, and credential
+precedence hardening `51f0570`, 2026-07-18): the CLI supports explicit
+`--dry-run`/`--apply`, one-session apply, stable
+first-eligible `--limit 1|10|50`, full all-eligible apply, bounded session
+concurrency, a shared stricter provider semaphore, owner-bound paid-call leases,
+per-chunk token checkpoints, final checkpoint reconciliation, and exact-rerun
+zero-cost output. CLI evidence is 19 library tests plus 8 spawned-process E2E
+tests passing; credentialed external tests remain ignored. The 1/10/50/full paid
+rollout, identical full rerun, and composed real Mistral + Neo4j test have not
+run.
+
+UI evidence (commit `a1f91f5`, hardened by `a125486`, 2026-07-18): strict Zod
+contracts, deterministic fallback, enrichment provenance, episodes, entities,
+claims, relations, and content-free citation navigation pass the browser contract
+suite. The live deterministic Rust API/Neo4j route has passed. A live browser run
+against a paid enriched graph and the planned graph/context/assurance surface
+remain open.
 
 ## Phase 4: risk and assurance
 
@@ -2245,13 +2320,13 @@ OpenCode begins working and the graph grows live.
 [x] Low-level events become semantic activities.
 [x] Mistral task classification uses a closed source-safe structured-output boundary.
 [x] Mistral classification and narrative extraction run concurrently and synchronize.
-[ ] Transcript enrichment is opt-in and reads only checksum-verified canonical rollouts.
-[ ] Local scanning removes secrets and PII before any raw-transcript provider transfer.
+[x] Transcript enrichment is opt-in and reads only checksum-verified canonical rollouts.
+[x] Local scanning removes secrets and PII before any raw-transcript provider transfer.
 [ ] Mistral receives bounded, cited transcript chunks only through the typed sensitive boundary.
-[ ] Every enrichment claim and relation cites resolvable source spans.
-[ ] Enrichment creates only versioned overlay nodes and edges; deterministic graph state is unchanged.
-[ ] Identical enrichment fingerprints are no-ops; changed versions create parallel runs.
-[ ] Partial or failed enrichment never becomes selected and never changes ingestion success.
+[x] Every enrichment claim and relation cites resolvable source spans.
+[x] Enrichment creates only versioned overlay nodes and edges; deterministic graph state is unchanged.
+[x] Identical enrichment fingerprints are no-ops; changed versions create parallel runs.
+[x] Partial or failed enrichment never becomes selected and never changes ingestion success.
 [ ] Real Mistral and real Neo4j E2E tests prove import, enrich, query, retry, and resumability.
 [ ] A full eligible-session backfill and identical rerun settle with reconciled usage and zero duplicates.
 [x] Neo4j reconstructs the full execution path.

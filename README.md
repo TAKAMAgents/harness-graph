@@ -21,23 +21,34 @@ The implementation contract is maintained in [`plan.md`](plan.md).
 - Unknown native variants are quarantined with typed provenance rather than
   silently dropped.
 - Mistral is the only supported foundation-model provider.
+- Mistral output is an additive, versioned overlay. It cannot replace or mutate
+  deterministic observations, activities, outcomes, risks, assurance,
+  ingestion receipts, or evidence edges.
 - Tests use real filesystem, process, HTTP, and Neo4j boundaries; no mocks or
   fake repositories/providers are used.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and provide the required values. Canonical names
-are documented in that file. The runtime also accepts the existing misspelled
-local aliases without logging their values. When a project `.env` exists, its
-canonical names and aliases are resolved before inherited process variables;
-this prevents unrelated workstation-wide Neo4j settings from silently taking
-precedence. Run commands from a neutral working directory to use process-only
-configuration.
+Copy `.env.example` to the repository-root `.env` and provide the required
+values. The CLI resolves that exact file from its compiled project location,
+independent of the current working directory. Neo4j credentials prefer canonical
+or backward-compatible alias values from that project file before inherited
+process values, preventing unrelated workstation settings from selecting another
+database. Other non-account optional settings may still be overridden by a
+non-empty process value. Configuration values are never logged.
 
 `MISTRAL_API_KEY` is the canonical and required foundation-model credential.
+Cost-bearing transcript enrichment is stricter than the other Mistral commands:
+it reads only the non-empty canonical `MISTRAL_API_KEY` in this project's
+`.env`. An inherited process value or the historical `MISTARL_API_KEY` typo
+cannot select a different account for transcript disclosure.
 `MISTRAL_MODEL` defaults to `mistral-small-latest` and rejects model names
-outside Mistral-hosted families. The credential has a redacted debug
-representation and is never included in command output.
+outside Mistral-hosted families for source-safe interpretation commands.
+Transcript enrichment independently pins `MISTRAL_TRANSCRIPT_MODEL` to
+`mistral-small-2603` and the stateless EU endpoint
+`https://api.eu.mistral.ai`; apply fails closed if the configured model differs.
+The credential has a redacted debug representation and is never included in
+command output.
 `MISTRAL_MAX_CONCURRENCY` defaults to `2` and is constrained to `1..=4`.
 
 `HARNESS_GRAPH_JOURNAL_PATH` selects the append-only live event journal and
@@ -114,6 +125,159 @@ calls and 56 deterministic semantic episodes. These are evidence-preserving
 episodes, not the later 15–25-item Mistral narrative summary; both layers have
 separate contracts in the plan.
 
+## Additive transcript knowledge enrichment
+
+Transcript enrichment composes two separate graph layers:
+
+```text
+checksum-verified raw/rollout.jsonl -> deterministic import -> authoritative base graph
+                                  \-> local scan/redact/chunk
+                                      -> Mistral EU structured extraction
+                                      -> citation validation -> versioned overlay
+```
+
+The local boundary excludes instruction bodies, hidden reasoning, assets, and
+binary content. It replaces recognized secrets and PII with stable keyed
+pseudonyms before provider transfer. Each bounded chunk asks Mistral to jointly
+classify knowledge kinds and extract cited episodes, entities, claims, and
+relations. Chunk calls run concurrently behind one shared provider semaphore;
+session aggregation is deterministic and makes no reducer call.
+
+### Dry run
+
+Inventory one session or the complete verified catalog without Mistral calls or
+Neo4j writes:
+
+```bash
+cargo run --release -p harness-graph-cli -- \
+  enrich-transcripts --session-id <uuid> \
+  --authorization <source-safe-operator-id> --dry-run
+
+cargo run --release -p harness-graph-cli -- \
+  enrich-all-transcripts --scope all \
+  --authorization <source-safe-operator-id> --dry-run
+```
+
+The complete release dry run on 2026-07-18 produced this source-safe inventory:
+
+| Measure | Observed value |
+| --- | ---: |
+| Discovered / eligible / metadata-only / blocked sessions | 1,369 / 867 / 10 / 492 |
+| Verified records | 2,410,017 |
+| Projected / sanitized fragments | 1,220,262 / 482,558 |
+| Sanitized bytes | 691,299,618 |
+| Expected chunks and API calls | 9,419 |
+| Estimated input / output tokens | 60,236,474 / 9,645,056 |
+| Estimated cost | 16,305,624 micro-USD (about $16.31) |
+| Actual external provider calls / Neo4j writes | 0 / 0 |
+
+All 492 blocks were scanner decisions: 327 non-text control-data, 26
+asset/binary, and 139 suspicious encoded-blob cases. The scan recorded 927
+known-secret, 165 private-key, 1,846 authentication-material, 3,580
+credential-URL, 351 provider-token, 2,682 high-entropy-assignment, 26,586 email,
+399 phone, 20,610 IP-address, and 485,580 home-path redactions. These are
+inventory estimates, not paid-run usage.
+
+The estimator is pinned to the repository's regional-EU pricing snapshot:
+$0.165 per million input tokens and $0.66 per million output tokens, represented
+as 165,000 and 660,000 micro-USD per million. Reconfirm provider pricing before
+any paid backfill.
+
+### Paid apply prerequisites
+
+Apply remains fail-closed until all of these are true:
+
+- `HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE=enabled`.
+- An operator has verified that the Mistral account's API training/data-sharing
+  control is disabled and set
+  `HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL=training_opt_out_verified`. This value
+  is an operator attestation; the CLI does not infer account privacy state.
+- The exact project `.env` contains canonical `MISTRAL_API_KEY`, and the resolved
+  transcript model is the pinned `mistral-small-2603` (also the default).
+- `HARNESS_GRAPH_REDACTION_HMAC_KEY` is one stable secret of at least 32 bytes,
+  distinct from every Mistral and Neo4j credential.
+- Neo4j is healthy and its deterministic and enrichment schemas can be applied.
+
+Keep the stable HMAC in a distinct 1Password item or field. One safe local
+pattern is an ignored `.env.enrichment-op` file containing only a secret
+reference:
+
+```dotenv
+HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE=enabled
+HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL=training_opt_out_verified
+HARNESS_GRAPH_REDACTION_HMAC_KEY=op://VAULT/ITEM/FIELD
+```
+
+Then inject it without printing or copying the value:
+
+```bash
+op run --env-file=.env.enrichment-op -- \
+  cargo run --release -p harness-graph-cli -- \
+  enrich-transcripts --session-id <uuid> \
+  --authorization <source-safe-operator-id> --apply
+```
+
+Do not rotate this key during a resumable run or identical rerun: changing it
+changes stable pseudonyms and therefore the enrichment fingerprint.
+
+### Bounded rollout and rerun
+
+The paid rollout commands below are implemented but have not yet been executed
+against the raw archive. Run them in order only after reviewing the dry run and
+the privacy attestation:
+
+```bash
+# One eligible session.
+op run --env-file=.env.enrichment-op -- \
+  cargo run --release -p harness-graph-cli -- \
+  enrich-all-transcripts --scope all --authorization <source-safe-operator-id> \
+  --apply --concurrency 2 --limit 1
+
+# Ten eligible sessions.
+op run --env-file=.env.enrichment-op -- \
+  cargo run --release -p harness-graph-cli -- \
+  enrich-all-transcripts --scope all --authorization <source-safe-operator-id> \
+  --apply --concurrency 2 --limit 10
+
+# Fifty eligible sessions.
+op run --env-file=.env.enrichment-op -- \
+  cargo run --release -p harness-graph-cli -- \
+  enrich-all-transcripts --scope all --authorization <source-safe-operator-id> \
+  --apply --concurrency 2 --limit 50
+
+# Full eligible catalog. Omit --limit.
+op run --env-file=.env.enrichment-op -- \
+  cargo run --release -p harness-graph-cli -- \
+  enrich-all-transcripts --scope all --authorization <source-safe-operator-id> \
+  --apply --concurrency 2
+
+# Identical full rerun: repeat the preceding command unchanged.
+```
+
+`--limit` selects the first 1–50 eligible sessions in stable catalog order;
+metadata-only and blocked sessions may be scanned before the selected limit is
+reached. Session concurrency is bounded to `1..=8`, while every session shares
+the stricter `MISTRAL_MAX_CONCURRENCY` provider gate. Each verified session's
+deterministic base import completes before provider work. Bulk apply settles all
+selected sessions, sorts its source-safe results, and exits nonzero if any
+session blocks or fails. Metadata-only sessions are successful no-ops.
+
+Before a missing chunk reaches Mistral, Neo4j atomically grants an owner-bound
+15-minute paid-call lease. Another live invocation sees `lease_busy` and makes
+no provider call. A successful projection and its token checkpoint commit
+together; failed work releases only its owner's lease, and an expired lease is
+recoverable. Final checkpoint reconciliation handles ambiguous commit results,
+and only a fully checkpointed run can atomically become the selected overlay.
+An exact selected fingerprint reports `submitted_chunks=0` and
+`new_cost_microusd=0`.
+
+Completed output reports `submitted_chunks`, `resumed_chunks`,
+`run_input_tokens`, `run_output_tokens`, `run_cost_microusd`, and
+`completion_disposition`. Bulk totals use
+`accounting_scope=completed_run_checkpoints`, so they include every checkpoint
+in the completed run, including resumed chunks. They are not counts of raw HTTP
+attempts or invocation-only token usage.
+
 ## Mistral interpretation and Pathfinder
 
 Verify the configured Mistral credential against the real model catalog:
@@ -177,7 +341,16 @@ GET  /health
 POST /v1/live/events
 GET  /v1/live/events?after=<sequence>
 GET  /v1/live/events/stream?after=<sequence>
+GET  /v1/experience/sessions
+GET  /v1/experience/sessions/{session_id}
 ```
+
+The experience routes return a deterministic fallback or the selected completed
+overlay with Mistral/model/prompt/schema and authorization-policy provenance.
+Citations resolve through content-free source anchors; raw transcript text,
+local paths, provider credentials, and Neo4j internal keys are excluded. See
+[`apps/graph-ui/README.md`](apps/graph-ui/README.md) for the response contract
+and UI startup with an API port override.
 
 Live adapters submit only source-safe typed events. For example:
 
@@ -236,6 +409,21 @@ cargo test -p harness-graph-cli --test live_mistral \
 cargo test -p harness-graph-cli --test live_mistral \
   live_pathfinder_preserves_typed_session_and_activity_citations -- --ignored --nocapture
 ```
+
+The composed transcript apply test uses real Neo4j and the canonical project
+Mistral credential, and is intentionally ignored until the privacy/HMAC gates
+are explicitly satisfied:
+
+```bash
+op run --env-file=.env.enrichment-op -- \
+  cargo test -p harness-graph-cli --test e2e \
+  transcript_apply_projects_additively_and_identical_rerun_submits_no_chunks \
+  -- --ignored --nocapture
+```
+
+That paid composed E2E, the 1/10/50/full archive backfill and identical rerun,
+and the live browser proof of a completed enriched graph plus assurance remain
+open validation gates in [`plan.md`](plan.md).
 
 Detailed architecture, commands, migration procedures, observability, and
 recovery instructions will remain synchronized here as each validated vertical
