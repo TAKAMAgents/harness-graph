@@ -1,5 +1,10 @@
 //! Rig-backed Mistral adapter for bounded interpretation and planning.
 
+mod retry_http;
+mod transcript_knowledge;
+
+pub use transcript_knowledge::*;
+
 use async_trait::async_trait;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,6 +22,7 @@ use harness_graph_planning::{
     PlannedStep, PlannedSteps, PlanningContext, PlanningError, PrecedentCitations, PrecedentPaths,
     SynchronizedInterpretation, TaskCategory, TaskClassificationRequest, TaskClassifier,
 };
+use harness_graph_transcript_enrichment::SensitiveValueSet;
 use rig::{
     client::{CompletionClient, ModelListingClient},
     completion::{StructuredOutputError, TypedPrompt},
@@ -27,7 +33,24 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use retry_http::{ProviderRetryGate, RetryAwareHttpClient};
+
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const MISTRAL_EU_API_BASE_URL: &str = "https://api.eu.mistral.ai";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptRequestTimeout(Duration);
+
+impl TranscriptRequestTimeout {
+    const DEFAULT: Self = Self(PROVIDER_REQUEST_TIMEOUT);
+
+    const fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+/// Pinned Mistral model used for sensitive transcript knowledge extraction.
+pub const MISTRAL_TRANSCRIPT_KNOWLEDGE_MODEL: &str = "mistral-small-2603";
 
 /// One bounded operation at the Mistral provider boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,10 +256,14 @@ impl MistralConcurrencyLimit {
 
 /// Concrete Rig client pinned to the Mistral provider.
 pub struct RigMistralAdapter {
-    client: mistral::Client,
+    client: mistral::Client<RetryAwareHttpClient>,
+    credential: MistralCredential,
     model: MistralModelName,
     concurrency: MistralConcurrencyLimit,
     permits: Arc<Semaphore>,
+    retry_gate: ProviderRetryGate,
+    transcript_request_timeout: TranscriptRequestTimeout,
+    output_secret_canaries: SensitiveValueSet,
 }
 
 impl RigMistralAdapter {
@@ -262,13 +289,48 @@ impl RigMistralAdapter {
         model: MistralModelName,
         concurrency: MistralConcurrencyLimit,
     ) -> Result<Self, MistralAdapterError> {
-        let client = mistral::Client::new(credential.0.expose_secret())
+        Self::with_concurrency_and_output_secrets(
+            credential,
+            model,
+            concurrency,
+            SensitiveValueSet::default(),
+        )
+    }
+
+    /// Construct a Mistral-only adapter with every locally known secret canary.
+    ///
+    /// The canaries are never exposed or iterated; transcript output is rejected
+    /// when any supplied value appears as a substring.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Rig cannot initialize its Mistral client.
+    pub fn with_concurrency_and_output_secrets(
+        credential: &MistralCredential,
+        model: MistralModelName,
+        concurrency: MistralConcurrencyLimit,
+        output_secret_canaries: SensitiveValueSet,
+    ) -> Result<Self, MistralAdapterError> {
+        let retry_gate = ProviderRetryGate::default();
+        let http_client = RetryAwareHttpClient::new(
+            rig::http_client::ReqwestClient::default(),
+            retry_gate.clone(),
+        );
+        let client = mistral::Client::builder()
+            .api_key(credential.0.expose_secret())
+            .base_url(MISTRAL_EU_API_BASE_URL)
+            .http_client(http_client)
+            .build()
             .map_err(|source| MistralAdapterError::Client { source })?;
         Ok(Self {
             client,
+            credential: credential.clone(),
             model,
             concurrency,
             permits: Arc::new(Semaphore::new(concurrency.value())),
+            retry_gate,
+            transcript_request_timeout: TranscriptRequestTimeout::DEFAULT,
+            output_secret_canaries,
         })
     }
 
@@ -847,6 +909,16 @@ mod tests {
     fn shared_adapter_is_safe_for_concurrent_async_branches() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RigMistralAdapter>();
+    }
+
+    #[test]
+    fn production_adapter_is_pinned_to_the_mistral_eu_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credential = MistralCredential::new("source-safe-contract-key")?;
+        let adapter =
+            RigMistralAdapter::new(&credential, MistralModelName::new("mistral-small-latest")?)?;
+        assert_eq!(adapter.client.base_url(), super::MISTRAL_EU_API_BASE_URL);
+        Ok(())
     }
 
     #[tokio::test]

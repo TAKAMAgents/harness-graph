@@ -10,15 +10,21 @@ rust-version.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 harness-graph-event-journal = { path = "../event-journal" }
+harness-graph-domain = { path = "../domain" }
+harness-graph-graph-port = { path = "../graph-port" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 
 [dev-dependencies]
+dotenvy.workspace = true
+harness-graph-neo4j-adapter = { path = "../neo4j-adapter" }
 reqwest = { version = "0.13", features = ["json", "stream"] }
+secrecy.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [lints]

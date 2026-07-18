@@ -1,5 +1,9 @@
 //! Neo4j implementation of the typed graph projection port.
 
+mod application;
+mod enrichment;
+mod experience;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -77,6 +81,28 @@ pub enum Neo4jAdapterError {
     /// Retrieved graph identity failed domain validation.
     #[error(transparent)]
     Domain(#[from] harness_graph_domain::DomainError),
+
+    /// Enrichment projection or persisted overlay data violated its typed contract.
+    #[error(transparent)]
+    Enrichment(#[from] harness_graph_graph_port::EnrichmentGraphError),
+
+    /// Source-safe experience projection violated its public response contract.
+    #[error(transparent)]
+    Experience(#[from] harness_graph_graph_port::ExperienceGraphError),
+
+    /// A persisted enrichment identity disagreed with an idempotent command.
+    #[error("existing enrichment {object} conflicts with the requested immutable identity")]
+    ConflictingEnrichment {
+        /// Closed source-safe overlay object name.
+        object: &'static str,
+    },
+
+    /// An enrichment lifecycle transition failed its graph preconditions.
+    #[error("enrichment transition {transition} rejected by graph invariants")]
+    EnrichmentTransition {
+        /// Closed source-safe transition name.
+        transition: &'static str,
+    },
 }
 
 /// Exact completion state for one content-addressed source snapshot.
@@ -1321,7 +1347,7 @@ mod tests {
         Ok(())
     }
 
-    async fn run_projection_scenario(
+    pub(crate) async fn run_projection_scenario(
         adapter: &Neo4jAdapter,
         namespace: &GraphNamespace,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1532,7 +1558,8 @@ mod tests {
         Ok(())
     }
 
-    async fn connect_from_environment() -> Result<Neo4jAdapter, Box<dyn std::error::Error>> {
+    pub(crate) async fn connect_from_environment()
+    -> Result<Neo4jAdapter, Box<dyn std::error::Error>> {
         let connection_url = required_env("NEO4J_CONNECTION_URL", "NEO4J_CONECTION_URL")?;
         let password = required_env("NEO4J_PASSWORD", "NEO4J_INATANSE_PASSWORD")?;
         let username = env::var("NEO4J_USERNAME").unwrap_or_else(|_| "neo4j".to_owned());

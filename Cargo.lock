@@ -775,15 +775,21 @@ name = "harness-graph-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dotenvy",
  "futures-util",
+ "harness-graph-domain",
  "harness-graph-event-journal",
+ "harness-graph-graph-port",
+ "harness-graph-neo4j-adapter",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "url",
  "uuid",
 ]
 
@@ -861,6 +867,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-graph-enrichment-application"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "harness-graph-domain",
+ "harness-graph-graph-port",
+ "harness-graph-protocol",
+ "harness-graph-transcript-enrichment",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "harness-graph-event-journal"
 version = "0.1.0"
 dependencies = [
@@ -910,6 +930,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "harness-graph-domain",
+ "harness-graph-enrichment-application",
  "harness-graph-ingestion",
  "harness-graph-planning",
  "harness-graph-protocol",
@@ -936,6 +957,7 @@ dependencies = [
  "harness-graph-classification",
  "harness-graph-correlation",
  "harness-graph-domain",
+ "harness-graph-enrichment-application",
  "harness-graph-graph-port",
  "harness-graph-ingestion",
  "harness-graph-path-analysis",
@@ -944,6 +966,7 @@ dependencies = [
  "neo4rs",
  "secrecy",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "time",
  "tokio",

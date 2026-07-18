@@ -1,5 +1,11 @@
 //! Provider-agnostic graph projection contract.
 
+mod enrichment;
+mod experience;
+
+pub use enrichment::*;
+pub use experience::*;
+
 use async_trait::async_trait;
 use harness_graph_domain::{
     AnalysisReport, DecodedNativeRecord, GraphNamespace, RecordCount, SessionId, SourceDigest,

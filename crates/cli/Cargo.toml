@@ -20,6 +20,7 @@ harness-graph-assurance = { path = "../assurance" }
 harness-graph-classification = { path = "../classification" }
 harness-graph-correlation = { path = "../correlation" }
 harness-graph-domain = { path = "../domain" }
+harness-graph-enrichment-application = { path = "../enrichment-application" }
 harness-graph-event-journal = { path = "../event-journal" }
 harness-graph-graph-port = { path = "../graph-port" }
 harness-graph-ingestion = { path = "../ingestion" }

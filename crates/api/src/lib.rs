@@ -1,4 +1,4 @@
-//! Axum ingestion and server-sent event surface for durable live events.
+//! Axum live-event ingestion, server-sent events, and source-safe experience reads.
 
 use std::{
     sync::{Arc, Mutex},
@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
@@ -16,6 +16,10 @@ use futures_util::{Stream, StreamExt, stream};
 use harness_graph_event_journal::{
     AppendOnlyJournal, AppendOutcome, JournalEntry, JournalError, JournalSequence, LiveEvent,
     ReplayCursor,
+};
+use harness_graph_graph_port::{
+    ExperienceReader, ExperienceScope, ExperienceSessionLookup, ExperienceSessionQuery,
+    ExperienceSessionSummaries,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -42,6 +46,18 @@ pub enum ApiError {
     /// The journal mutex was poisoned by a failed filesystem operation.
     #[error("journal synchronization state is poisoned")]
     PoisonedJournal,
+
+    /// A session path parameter failed typed identity validation.
+    #[error("invalid experience session identifier")]
+    InvalidExperienceSessionId,
+
+    /// The read-only experience store could not satisfy the request.
+    #[error("experience graph is unavailable")]
+    ExperienceUnavailable,
+
+    /// No verified deterministic experience exists for the requested session.
+    #[error("experience session was not found")]
+    ExperienceSessionNotFound,
 }
 
 impl IntoResponse for ApiError {
@@ -68,6 +84,21 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "journal_unavailable",
                 "durable live journal is unavailable",
+            ),
+            Self::InvalidExperienceSessionId => (
+                StatusCode::BAD_REQUEST,
+                "invalid_experience_session_id",
+                "session identifier must be a UUID",
+            ),
+            Self::ExperienceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "experience_unavailable",
+                "the source-safe experience graph is unavailable",
+            ),
+            Self::ExperienceSessionNotFound => (
+                StatusCode::NOT_FOUND,
+                "experience_session_not_found",
+                "no verified experience exists for this session",
             ),
         };
         (status, Json(ErrorOutput { code, message })).into_response()
@@ -137,6 +168,97 @@ pub fn router(journal: AppendOnlyJournal) -> Router {
         .route("/v1/live/events/stream", get(stream_events))
         .layer(DefaultBodyLimit::max(MAX_EVENT_BODY_BYTES))
         .with_state(state)
+}
+
+/// Build the journal router plus typed read-only experience routes.
+///
+/// The reader error is intentionally erased at the HTTP boundary so driver,
+/// topology, credential, and query details can never enter a response body.
+pub fn router_with_experience<R>(
+    journal: AppendOnlyJournal,
+    reader: R,
+    scope: ExperienceScope,
+) -> Router
+where
+    R: ExperienceReader + 'static,
+{
+    router(journal).merge(
+        Router::new()
+            .route(
+                "/v1/experience/sessions",
+                get(list_experience_sessions::<R>),
+            )
+            .route(
+                "/v1/experience/sessions/{session_id}",
+                get(read_experience_session::<R>),
+            )
+            .with_state(ExperienceState::new(reader, scope)),
+    )
+}
+
+struct ExperienceState<R> {
+    reader: Arc<R>,
+    scope: ExperienceScope,
+}
+
+impl<R> ExperienceState<R> {
+    fn new(reader: R, scope: ExperienceScope) -> Self {
+        Self {
+            reader: Arc::new(reader),
+            scope,
+        }
+    }
+}
+
+impl<R> Clone for ExperienceState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            reader: Arc::clone(&self.reader),
+            scope: self.scope.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExperienceSessionListOutput {
+    sessions: ExperienceSessionSummaries,
+}
+
+async fn list_experience_sessions<R>(
+    State(state): State<ExperienceState<R>>,
+) -> Result<Json<ExperienceSessionListOutput>, ApiError>
+where
+    R: ExperienceReader + 'static,
+{
+    let sessions = state
+        .reader
+        .experience_sessions(&state.scope)
+        .await
+        .map_err(|_| ApiError::ExperienceUnavailable)?;
+    Ok(Json(ExperienceSessionListOutput { sessions }))
+}
+
+async fn read_experience_session<R>(
+    State(state): State<ExperienceState<R>>,
+    Path(session_id): Path<String>,
+) -> Result<Response, ApiError>
+where
+    R: ExperienceReader + 'static,
+{
+    let session_id = harness_graph_domain::SessionId::parse(&session_id)
+        .map_err(|_| ApiError::InvalidExperienceSessionId)?;
+    let lookup = state
+        .reader
+        .experience_session(&ExperienceSessionQuery::new(
+            state.scope.clone(),
+            session_id,
+        ))
+        .await
+        .map_err(|_| ApiError::ExperienceUnavailable)?;
+    match lookup {
+        ExperienceSessionLookup::Found(detail) => Ok(Json(detail).into_response()),
+        ExperienceSessionLookup::NotFound => Err(ApiError::ExperienceSessionNotFound),
+    }
 }
 
 #[derive(Debug, Serialize)]

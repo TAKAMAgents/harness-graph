@@ -6,6 +6,7 @@ members = [
     "crates/correlation",
     "crates/classification",
     "crates/transcript-enrichment",
+    "crates/enrichment-application",
     "crates/assurance",
     "crates/risk",
     "crates/path-analysis",

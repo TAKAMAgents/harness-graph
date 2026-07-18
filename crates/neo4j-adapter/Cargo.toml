@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 harness-graph-domain = { path = "../domain" }
+harness-graph-enrichment-application = { path = "../enrichment-application" }
 harness-graph-graph-port = { path = "../graph-port" }
 harness-graph-planning = { path = "../planning" }
 neo4rs.workspace = true
@@ -27,6 +28,7 @@ harness-graph-correlation = { path = "../correlation" }
 harness-graph-ingestion = { path = "../ingestion" }
 harness-graph-path-analysis = { path = "../path-analysis" }
 harness-graph-risk = { path = "../risk" }
+serde_json.workspace = true
 url.workspace = true
 uuid.workspace = true
 

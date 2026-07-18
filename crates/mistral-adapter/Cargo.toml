@@ -8,8 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes = "1"
+futures-util.workspace = true
 harness-graph-domain = { path = "../domain" }
+harness-graph-enrichment-application = { path = "../enrichment-application" }
 harness-graph-planning = { path = "../planning" }
+harness-graph-transcript-enrichment = { path = "../transcript-enrichment" }
+httpdate = "1"
 rig.workspace = true
 schemars.workspace = true
 secrecy.workspace = true
@@ -21,7 +26,10 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 dotenvy.workspace = true
+harness-graph-ingestion = { path = "../ingestion" }
+harness-graph-protocol = { path = "../protocol" }
 
 [lints]
 workspace = true
