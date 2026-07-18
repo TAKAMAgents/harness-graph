@@ -138,7 +138,7 @@ fn doctor_reports_mistral_without_exposing_secrets() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn explicit_process_configuration_overrides_repository_file_values()
+fn unrelated_working_directory_dotenv_is_ignored_and_process_configuration_is_preserved()
 -> Result<(), Box<dyn std::error::Error>> {
     let working_directory = tempfile::tempdir()?;
     std::fs::write(
@@ -160,6 +160,37 @@ fn explicit_process_configuration_overrides_repository_file_values()
     let result: serde_json::Value = serde_json::from_str(&rendered)?;
     assert_eq!(result["unique_sessions"], 1);
     assert!(!rendered.contains("file-only-canary"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the real Mistral credential from the repository .env"]
+fn repository_canonical_mistral_key_wins_over_inherited_and_cwd_values_end_to_end()
+-> Result<(), Box<dyn std::error::Error>> {
+    let environment = RepositoryEnvironment::load()?;
+    let working_directory = tempfile::tempdir()?;
+    std::fs::write(
+        working_directory.path().join(".env"),
+        "MISTRAL_API_KEY=deliberately-invalid-cwd-key\n",
+    )?;
+    let output = environment
+        .command(&fixture_root()?, "cli_mistral_config_e2e")
+        .current_dir(working_directory.path())
+        .env("MISTRAL_API_KEY", "deliberately-invalid-inherited-key")
+        .arg("mistral-health")
+        .output()?;
+
+    ensure(
+        output.status.success(),
+        "repository Mistral credential was not selected",
+    )?;
+    ensure_secret_safe(&environment, &output)?;
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!rendered.contains("deliberately-invalid"));
     Ok(())
 }
 
@@ -287,6 +318,69 @@ fn transcript_dry_run_scans_real_verified_fixture_without_external_clients()
 }
 
 #[test]
+fn transcript_apply_contract_and_privacy_gates_fail_closed_before_external_clients()
+-> Result<(), Box<dyn std::error::Error>> {
+    let help = command()?
+        .args(["enrich-all-transcripts", "--help"])
+        .output()?;
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout)?;
+    for required in [
+        "--dry-run",
+        "--apply",
+        "--concurrency",
+        "--limit",
+        "--authorization",
+    ] {
+        assert!(help.contains(required));
+    }
+
+    let disabled = command()?
+        .env("NEO4J_CONNECTION_URL", "deliberately-invalid")
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "disabled")
+        .env(
+            "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL",
+            "training_opt_out_verified",
+        )
+        .args([
+            "enrich-transcripts",
+            "--session-id",
+            SESSION_ID,
+            "--authorization",
+            "operator-e2e",
+            "--apply",
+        ])
+        .output()?;
+    assert!(!disabled.status.success());
+    let disabled = String::from_utf8(disabled.stderr)?;
+    assert!(disabled.contains("enrichment_enabled"));
+    assert!(!disabled.contains("Neo4j connection failed"));
+    assert!(!disabled.contains("source-safe-test-key"));
+    assert!(!disabled.contains("source-safe-test-password"));
+
+    let unverified = command()?
+        .env("NEO4J_CONNECTION_URL", "deliberately-invalid")
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "enabled")
+        .env("HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL", "unverified")
+        .args([
+            "enrich-transcripts",
+            "--session-id",
+            SESSION_ID,
+            "--authorization",
+            "operator-e2e",
+            "--apply",
+        ])
+        .output()?;
+    assert!(!unverified.status.success());
+    let unverified = String::from_utf8(unverified.stderr)?;
+    assert!(unverified.contains("training_opt_out_verified"));
+    assert!(!unverified.contains("Neo4j connection failed"));
+    assert!(!unverified.contains("source-safe-test-key"));
+    assert!(!unverified.contains("source-safe-test-password"));
+    Ok(())
+}
+
+#[test]
 fn deterministic_analysis_preserves_partial_calls_and_evidence()
 -> Result<(), Box<dyn std::error::Error>> {
     let output = run_json(&["analyze", "--session-id", SESSION_ID])?;
@@ -373,6 +467,78 @@ async fn bulk_import_settles_repairs_and_preserves_shared_source_provenance()
     scenario?;
     cleanup?;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires real Neo4j and Mistral; performs a paid call on source-safe fixture data"]
+async fn transcript_apply_projects_additively_and_identical_rerun_submits_no_chunks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let environment = RepositoryEnvironment::load()?;
+    let namespace = format!("cli_enrichment_e2e_{}", uuid::Uuid::now_v7().simple());
+    let graph = environment.graph().await?;
+    let scenario = run_transcript_apply_rerun_scenario(&environment, &namespace);
+    let cleanup = purge_namespace(&graph, &namespace).await;
+    scenario?;
+    cleanup?;
+    Ok(())
+}
+
+fn run_transcript_apply_rerun_scenario(
+    environment: &RepositoryEnvironment,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let first = transcript_apply_command(environment, namespace)?.output()?;
+    ensure(first.status.success(), "first transcript apply failed")?;
+    ensure_secret_safe(environment, &first)?;
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    ensure(
+        first["status"] == "completed"
+            && first["submitted_chunks"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && first["run_input_tokens"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+        "first transcript apply did not commit a provider-backed run",
+    )?;
+
+    let second = transcript_apply_command(environment, namespace)?.output()?;
+    ensure(second.status.success(), "identical transcript rerun failed")?;
+    ensure_secret_safe(environment, &second)?;
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    ensure(
+        second["status"] == "exact_fingerprint_unchanged"
+            && second["submitted_chunks"] == 0
+            && second["new_cost_microusd"] == 0,
+        "identical transcript rerun did not preserve the zero-submission identity",
+    )
+}
+
+fn transcript_apply_command(
+    environment: &RepositoryEnvironment,
+    namespace: &str,
+) -> Result<Command, Box<dyn std::error::Error>> {
+    let mut command = environment.command(&fixture_root()?, namespace);
+    command
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "enabled")
+        .env(
+            "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL",
+            "training_opt_out_verified",
+        )
+        .env(
+            "HARNESS_GRAPH_REDACTION_HMAC_KEY",
+            "source-safe-e2e-stable-redaction-key-00000000000000000000",
+        )
+        .env("MISTRAL_TRANSCRIPT_MODEL", "mistral-small-2603")
+        .args([
+            "enrich-transcripts",
+            "--session-id",
+            SESSION_ID,
+            "--authorization",
+            "operator-live-e2e",
+            "--apply",
+        ]);
+    Ok(command)
 }
 
 async fn run_bulk_import_scenario(
@@ -640,26 +806,87 @@ fn ensure(condition: bool, message: &'static str) -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-async fn serve_process_durably_accepts_and_replays_live_events()
+#[ignore = "requires the real Neo4j credentials from the repository .env"]
+async fn serve_process_exposes_real_experience_reads_and_preserves_journal_routes()
 -> Result<(), Box<dyn std::error::Error>> {
+    let environment = RepositoryEnvironment::load()?;
     let temporary = tempfile::tempdir()?;
+    let namespace = format!("cli_serve_e2e_{}", uuid::Uuid::now_v7().simple());
+    let graph = environment.graph().await?;
+    let imported = environment
+        .command(&fixture_root()?, &namespace)
+        .args(["import", "--session-id", SESSION_ID])
+        .output()?;
+    ensure(
+        imported.status.success(),
+        "source-safe fixture import failed",
+    )?;
+    ensure_secret_safe(&environment, &imported)?;
+
     let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address = reservation.local_addr()?;
     drop(reservation);
-    let child = command()?
+    let child = environment
+        .command(&fixture_root()?, &namespace)
         .env("HARNESS_GRAPH_BIND_ADDRESS", address.to_string())
         .env(
             "HARNESS_GRAPH_JOURNAL_PATH",
             temporary.path().join("live.jsonl"),
         )
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "disabled")
         .arg("serve")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
     let mut server = ServerProcess::new(child);
+    let scenario = exercise_serve_routes(&environment, address, &mut server).await;
+    let cleanup = purge_namespace(&graph, &namespace).await;
+    scenario?;
+    cleanup?;
+    Ok(())
+}
+
+async fn exercise_serve_routes(
+    environment: &RepositoryEnvironment,
+    address: std::net::SocketAddr,
+    server: &mut ServerProcess,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let base = format!("http://{address}");
     wait_until_ready(&client, &base).await?;
+
+    let sessions = client
+        .get(format!("{base}/v1/experience/sessions"))
+        .send()
+        .await?;
+    ensure(
+        sessions.status().is_success(),
+        "experience session list was unavailable",
+    )?;
+    let sessions = sessions.json::<serde_json::Value>().await?;
+    ensure(
+        sessions["sessions"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value["session_id"] == SESSION_ID)),
+        "imported session was absent from the experience list",
+    )?;
+
+    let detail = client
+        .get(format!("{base}/v1/experience/sessions/{SESSION_ID}"))
+        .send()
+        .await?;
+    ensure(
+        detail.status().is_success(),
+        "experience session detail was unavailable",
+    )?;
+    let detail = detail.json::<serde_json::Value>().await?;
+    ensure(
+        detail["display"]["source"] == "deterministic_fallback"
+            && detail["enrichment"]["state"] == "unavailable"
+            && detail["enrichment"]["reason"] == "disabled",
+        "disabled enrichment visibility was not preserved",
+    )?;
+
     let event_id = uuid::Uuid::now_v7().to_string();
     let event = serde_json::json!({
         "event_id": event_id,
@@ -671,7 +898,6 @@ async fn serve_process_durably_accepts_and_replays_live_events()
             "status": "succeeded"
         }
     });
-
     let appended = client
         .post(format!("{base}/v1/live/events"))
         .json(&event)
@@ -686,6 +912,11 @@ async fn serve_process_durably_accepts_and_replays_live_events()
         .await?;
     assert_eq!(replay["entries"].as_array().map(Vec::len), Some(1));
     assert_eq!(replay["entries"][0]["event"]["event_id"], event_id);
+
+    let rendered = format!("{sessions}{detail}{replay}");
+    assert!(!rendered.contains(&environment.neo4j_password));
+    assert!(!rendered.contains(&environment.mistral_api_key));
+    assert!(!rendered.contains("/Users/"));
 
     server.stop()?;
     Ok(())

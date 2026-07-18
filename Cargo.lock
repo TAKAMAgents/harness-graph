@@ -822,6 +822,7 @@ dependencies = [
  "harness-graph-classification",
  "harness-graph-correlation",
  "harness-graph-domain",
+ "harness-graph-enrichment-application",
  "harness-graph-event-journal",
  "harness-graph-graph-port",
  "harness-graph-ingestion",

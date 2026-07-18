@@ -6,4 +6,4 @@ mod error;
 
 pub use command::run;
 pub use config::{AppConfig, MistralPrivacyControl, Neo4jConnection, TranscriptEnrichmentMode};
-pub use error::CliError;
+pub use error::{CliError, TranscriptApplyRequirement};

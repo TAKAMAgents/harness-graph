@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use harness_graph_domain::GraphNamespace;
 use harness_graph_event_journal::JournalPath;
-use harness_graph_graph_port::BatchSize;
+use harness_graph_graph_port::{BatchSize, ExperienceEnrichmentVisibility};
 use harness_graph_ingestion::ArchiveRoot;
 use harness_graph_mistral_adapter::{MistralConcurrencyLimit, MistralCredential, MistralModelName};
 use harness_graph_transcript_enrichment::{
@@ -101,7 +101,31 @@ impl AppConfig {
     ///
     /// Returns an error when the canonical project credential is absent.
     pub fn mistral_credential(&self) -> Result<MistralCredential, CliError> {
-        let key = required_setting(&self.values, "MISTRAL_API_KEY", &["MISTARL_API_KEY"])?;
+        let key = project_canonical_preferred_setting(
+            &self.values,
+            "MISTRAL_API_KEY",
+            &["MISTARL_API_KEY"],
+            optional_process_value,
+        )?;
+        Ok(MistralCredential::new(key)?)
+    }
+
+    /// Resolve the transcript credential from the canonical project file only.
+    ///
+    /// Transcript disclosure is intentionally stricter than source-safe model
+    /// commands: neither inherited process values nor the historical misspelled
+    /// alias may silently select a different Mistral account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the project `.env` contains `MISTRAL_API_KEY`.
+    pub fn transcript_mistral_credential(&self) -> Result<MistralCredential, CliError> {
+        let key = self
+            .values
+            .value("MISTRAL_API_KEY")
+            .ok_or(CliError::MissingConfiguration {
+                canonical_name: "MISTRAL_API_KEY",
+            })?;
         Ok(MistralCredential::new(key)?)
     }
 
@@ -179,6 +203,7 @@ impl AppConfig {
     /// boundary permits.
     pub fn pseudonymization_key(&self) -> Result<PseudonymizationKey, CliError> {
         let key = required_setting(&self.values, "HARNESS_GRAPH_REDACTION_HMAC_KEY", &[])?;
+        validate_dedicated_pseudonymization_key(&self.values, &key, optional_process_value)?;
         Ok(PseudonymizationKey::new(key)?)
     }
 
@@ -306,6 +331,15 @@ pub enum TranscriptEnrichmentMode {
     Enabled,
 }
 
+impl From<TranscriptEnrichmentMode> for ExperienceEnrichmentVisibility {
+    fn from(value: TranscriptEnrichmentMode) -> Self {
+        match value {
+            TranscriptEnrichmentMode::Disabled => Self::Disabled,
+            TranscriptEnrichmentMode::Enabled => Self::Enabled,
+        }
+    }
+}
+
 /// Attested Mistral account data-training state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MistralPrivacyControl {
@@ -419,7 +453,10 @@ struct ConfigurationFile(Vec<(String, String)>);
 
 impl ConfigurationFile {
     fn load_optional() -> Result<Self, CliError> {
-        let iterator = match dotenvy::dotenv_iter() {
+        let project_environment = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".env");
+        let iterator = match dotenvy::from_path_iter(project_environment) {
             Ok(iterator) => iterator,
             Err(error) if error.not_found() => return Ok(Self(Vec::new())),
             Err(_) => return Err(CliError::ConfigurationFile),
@@ -437,6 +474,53 @@ impl ConfigurationFile {
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+    }
+}
+
+fn project_canonical_preferred_setting<F>(
+    file: &ConfigurationFile,
+    canonical: &'static str,
+    aliases: &[&str],
+    process_value: F,
+) -> Result<String, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    file.value(canonical)
+        .or_else(|| process_value(canonical))
+        .or_else(|| aliases.iter().find_map(|alias| file.value(alias)))
+        .or_else(|| aliases.iter().find_map(|alias| process_value(alias)))
+        .ok_or(CliError::MissingConfiguration {
+            canonical_name: canonical,
+        })
+}
+
+fn validate_dedicated_pseudonymization_key<F>(
+    file: &ConfigurationFile,
+    key: &str,
+    process_value: F,
+) -> Result<(), CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let credential_names = [
+        "MISTRAL_API_KEY",
+        "MISTARL_API_KEY",
+        "NEO4J_PASSWORD",
+        "NEO4J_INATANSE_PASSWORD",
+    ];
+    if credential_names.iter().any(|name| {
+        [process_value(name), file.value(name)]
+            .into_iter()
+            .flatten()
+            .any(|credential| credential == key)
+    }) {
+        Err(CliError::InvalidConfiguration {
+            canonical_name: "HARNESS_GRAPH_REDACTION_HMAC_KEY",
+            reason: "must be a dedicated key distinct from provider and database credentials",
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -459,7 +543,18 @@ fn required_setting(
 }
 
 fn optional_setting(file: &ConfigurationFile, name: &str) -> Option<String> {
-    optional_process_value(name).or_else(|| file.value(name))
+    optional_setting_with_lookup(file, name, optional_process_value)
+}
+
+fn optional_setting_with_lookup<F>(
+    file: &ConfigurationFile,
+    name: &str,
+    process_value: F,
+) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    process_value(name).or_else(|| file.value(name))
 }
 
 fn optional_process_value(name: &str) -> Option<String> {
@@ -570,6 +665,152 @@ mod tests {
             config.mistral_privacy_control(),
             Ok(MistralPrivacyControl::TrainingOptOutVerified)
         ));
+    }
+
+    #[test]
+    fn repository_canonical_mistral_key_precedes_inherited_and_alias_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let values = ConfigurationFile(vec![
+            (
+                "MISTRAL_API_KEY".to_owned(),
+                "repository-canonical-canary".to_owned(),
+            ),
+            (
+                "MISTARL_API_KEY".to_owned(),
+                "repository-alias-canary".to_owned(),
+            ),
+        ]);
+        let process_value = |name: &str| match name {
+            "MISTRAL_API_KEY" => Some("process-canonical-canary".to_owned()),
+            "MISTARL_API_KEY" => Some("process-alias-canary".to_owned()),
+            _ => None,
+        };
+
+        let selected = project_canonical_preferred_setting(
+            &values,
+            "MISTRAL_API_KEY",
+            &["MISTARL_API_KEY"],
+            process_value,
+        )?;
+
+        assert_eq!(selected, "repository-canonical-canary");
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_credential_requires_the_canonical_project_file_key() {
+        let alias_only = AppConfig {
+            values: ConfigurationFile(vec![(
+                "MISTARL_API_KEY".to_owned(),
+                "source-safe-alias-canary".to_owned(),
+            )]),
+        };
+        assert!(alias_only.transcript_mistral_credential().is_err());
+
+        let canonical = AppConfig {
+            values: ConfigurationFile(vec![(
+                "MISTRAL_API_KEY".to_owned(),
+                "source-safe-canonical-canary".to_owned(),
+            )]),
+        };
+        assert!(canonical.transcript_mistral_credential().is_ok());
+    }
+
+    #[test]
+    fn mistral_key_falls_back_to_process_canonical_only_when_project_key_is_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let values = ConfigurationFile(vec![(
+            "MISTARL_API_KEY".to_owned(),
+            "repository-alias-canary".to_owned(),
+        )]);
+        let process_value =
+            |name: &str| (name == "MISTRAL_API_KEY").then(|| "process-canonical-canary".to_owned());
+
+        let selected = project_canonical_preferred_setting(
+            &values,
+            "MISTRAL_API_KEY",
+            &["MISTARL_API_KEY"],
+            process_value,
+        )?;
+
+        assert_eq!(selected, "process-canonical-canary");
+        Ok(())
+    }
+
+    #[test]
+    fn pseudonymization_key_must_be_distinct_from_every_loaded_credential() {
+        let shared = "shared-source-safe-key-material-000000000000";
+        let values = ConfigurationFile(vec![("MISTRAL_API_KEY".to_owned(), shared.to_owned())]);
+        let no_process_values = |_: &str| None;
+
+        assert!(
+            validate_dedicated_pseudonymization_key(&values, shared, no_process_values).is_err()
+        );
+        assert!(
+            validate_dedicated_pseudonymization_key(
+                &values,
+                "dedicated-source-safe-hmac-key-000000000000",
+                no_process_values,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn runtime_transcript_controls_remain_process_overridable() {
+        let file = ConfigurationFile(vec![
+            (
+                "HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE".to_owned(),
+                "disabled".to_owned(),
+            ),
+            (
+                "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL".to_owned(),
+                "unverified".to_owned(),
+            ),
+            (
+                "HARNESS_GRAPH_REDACTION_HMAC_KEY".to_owned(),
+                "repository-hmac-canary".to_owned(),
+            ),
+        ]);
+        let process_value = |name: &str| match name {
+            "HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE" => Some("enabled".to_owned()),
+            "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL" => Some("training_opt_out_verified".to_owned()),
+            "HARNESS_GRAPH_REDACTION_HMAC_KEY" => Some("runtime-hmac-canary".to_owned()),
+            _ => None,
+        };
+
+        assert_eq!(
+            optional_setting_with_lookup(
+                &file,
+                "HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE",
+                process_value,
+            ),
+            Some("enabled".to_owned())
+        );
+        assert_eq!(
+            optional_setting_with_lookup(
+                &file,
+                "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL",
+                process_value,
+            ),
+            Some("training_opt_out_verified".to_owned())
+        );
+        assert_eq!(
+            optional_setting_with_lookup(&file, "HARNESS_GRAPH_REDACTION_HMAC_KEY", process_value,),
+            Some("runtime-hmac-canary".to_owned())
+        );
+    }
+
+    #[test]
+    fn transcript_mode_maps_to_exact_experience_visibility() {
+        assert_eq!(
+            ExperienceEnrichmentVisibility::from(TranscriptEnrichmentMode::Disabled),
+            ExperienceEnrichmentVisibility::Disabled
+        );
+        assert_eq!(
+            ExperienceEnrichmentVisibility::from(TranscriptEnrichmentMode::Enabled),
+            ExperienceEnrichmentVisibility::Enabled
+        );
     }
 
     #[test]

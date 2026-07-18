@@ -1,8 +1,10 @@
 //! CLI command parsing and orchestration.
 
+mod transcript_apply;
+
 use std::{fmt, str::FromStr};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::{StreamExt, stream};
 use harness_graph_assurance::assess_outcome;
 use harness_graph_classification::ActivityBuilder;
@@ -13,8 +15,8 @@ use harness_graph_domain::{
 };
 use harness_graph_event_journal::AppendOnlyJournal;
 use harness_graph_graph_port::{
-    AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector,
-    SourceSnapshotCommand,
+    AnalysisProjectionCommand, ExperienceScope, FinalizeIngestionCommand, GraphBatch, GraphCommand,
+    GraphProjector, SourceSnapshotCommand,
 };
 use harness_graph_ingestion::{
     DecodedRecordStream, IngestionError, SessionBundle, SessionScope, SourceKind,
@@ -43,6 +45,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use crate::{AppConfig, CliError};
 
+use self::transcript_apply::{enrich_all_transcripts_apply, enrich_transcripts_apply};
+
 /// Run the command selected by process arguments.
 ///
 /// # Errors
@@ -69,36 +73,50 @@ pub async fn run() -> Result<(), CliError> {
             session_id,
             authorization,
             disclosure_scope,
-            dry_run,
-        } => {
-            if dry_run {
-                enrich_transcripts_dry_run(
+            execution,
+        } => match execution.resolve()? {
+            TranscriptExecutionMode::DryRun => enrich_transcripts_dry_run(
+                &config,
+                &session_id,
+                authorization,
+                disclosure_scope.into(),
+            ),
+            TranscriptExecutionMode::Apply => {
+                enrich_transcripts_apply(
                     &config,
                     &session_id,
                     authorization,
                     disclosure_scope.into(),
                 )
-            } else {
-                Err(CliError::TranscriptExecutionModeRequired)
+                .await
             }
-        }
+        },
         Command::EnrichAllTranscripts {
             scope,
             authorization,
             disclosure_scope,
-            dry_run,
-        } => {
-            if dry_run {
-                enrich_all_transcripts_dry_run(
+            concurrency,
+            limit,
+            execution,
+        } => match execution.resolve()? {
+            TranscriptExecutionMode::DryRun => enrich_all_transcripts_dry_run(
+                &config,
+                scope.into(),
+                authorization,
+                disclosure_scope.into(),
+            ),
+            TranscriptExecutionMode::Apply => {
+                enrich_all_transcripts_apply(
                     &config,
                     scope.into(),
                     authorization,
                     disclosure_scope.into(),
+                    concurrency,
+                    limit.into(),
                 )
-            } else {
-                Err(CliError::TranscriptExecutionModeRequired)
+                .await
             }
-        }
+        },
         Command::Serve => serve(&config).await,
     }
 }
@@ -197,9 +215,8 @@ enum Command {
         /// Closed transcript disclosure scope.
         #[arg(long, value_enum, default_value_t = DisclosureScopeArgument::ConversationAndExecution)]
         disclosure_scope: DisclosureScopeArgument,
-        /// Perform only local verification, scanning, chunk estimation, and reporting.
-        #[arg(long)]
-        dry_run: bool,
+        #[command(flatten)]
+        execution: TranscriptExecutionArguments,
     },
     /// Inventory every transcript in an archive scope without external mutation.
     EnrichAllTranscripts {
@@ -212,9 +229,14 @@ enum Command {
         /// Closed transcript disclosure scope.
         #[arg(long, value_enum, default_value_t = DisclosureScopeArgument::ConversationAndExecution)]
         disclosure_scope: DisclosureScopeArgument,
-        /// Perform only local verification, scanning, chunk estimation, and reporting.
+        /// Maximum simultaneous session workflows. Provider calls also share a stricter global gate.
+        #[arg(long, default_value_t = EnrichmentSessionConcurrencyLimit::default())]
+        concurrency: EnrichmentSessionConcurrencyLimit,
+        /// Stop after the first N eligible sessions in stable catalog order (1-50).
         #[arg(long)]
-        dry_run: bool,
+        limit: Option<EligibleSessionLimit>,
+        #[command(flatten)]
+        execution: TranscriptExecutionArguments,
     },
     /// Serve durable live ingestion, replay, and server-sent events.
     Serve,
@@ -232,6 +254,34 @@ enum ScopeArgument {
 enum DisclosureScopeArgument {
     ConversationOnly,
     ConversationAndExecution,
+}
+
+/// Raw CLI flags immediately converted into a semantic execution mode.
+#[derive(Debug, Clone, Copy, Args)]
+#[group(required = true, multiple = false)]
+struct TranscriptExecutionArguments {
+    /// Perform only local verification, scanning, chunk estimation, and reporting.
+    #[arg(long)]
+    dry_run: bool,
+    /// Import the deterministic base, call Mistral on locally sanitized chunks, and project the additive overlay.
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptExecutionMode {
+    DryRun,
+    Apply,
+}
+
+impl TranscriptExecutionArguments {
+    fn resolve(self) -> Result<TranscriptExecutionMode, CliError> {
+        match (self.dry_run, self.apply) {
+            (true, false) => Ok(TranscriptExecutionMode::DryRun),
+            (false, true) => Ok(TranscriptExecutionMode::Apply),
+            (false, false) | (true, true) => Err(CliError::TranscriptExecutionModeRequired),
+        }
+    }
 }
 
 impl From<DisclosureScopeArgument> for TranscriptDisclosureScope {
@@ -288,6 +338,105 @@ impl FromStr for ImportConcurrencyLimit {
 #[error("expected an integer between 1 and 8")]
 struct ImportConcurrencyParseError;
 
+/// Bounded number of end-to-end transcript session workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct EnrichmentSessionConcurrencyLimit(usize);
+
+impl EnrichmentSessionConcurrencyLimit {
+    const DEFAULT: usize = 2;
+    const MAX: usize = 8;
+
+    const fn value(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for EnrichmentSessionConcurrencyLimit {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
+    }
+}
+
+impl fmt::Display for EnrichmentSessionConcurrencyLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for EnrichmentSessionConcurrencyLimit {
+    type Err = EnrichmentSessionConcurrencyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value
+            .parse::<usize>()
+            .map_err(|_| EnrichmentSessionConcurrencyParseError)?;
+        if (1..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(EnrichmentSessionConcurrencyParseError)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("expected an integer between 1 and 8")]
+struct EnrichmentSessionConcurrencyParseError;
+
+/// Optional stable-order pilot bound over eligible sessions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct EligibleSessionLimit(usize);
+
+impl EligibleSessionLimit {
+    const MAX: usize = 50;
+
+    const fn value(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for EligibleSessionLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for EligibleSessionLimit {
+    type Err = EligibleSessionLimitParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value
+            .parse::<usize>()
+            .map_err(|_| EligibleSessionLimitParseError)?;
+        if (1..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(EligibleSessionLimitParseError)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("expected an integer between 1 and 50")]
+struct EligibleSessionLimitParseError;
+
+/// Stable provider-eligible selection policy for a bulk apply invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EligibleSessionSelection {
+    All,
+    First(EligibleSessionLimit),
+}
+
+impl From<Option<EligibleSessionLimit>> for EligibleSessionSelection {
+    fn from(value: Option<EligibleSessionLimit>) -> Self {
+        match value {
+            Some(limit) => Self::First(limit),
+            None => Self::All,
+        }
+    }
+}
+
 impl From<ScopeArgument> for SessionScope {
     fn from(value: ScopeArgument) -> Self {
         match value {
@@ -331,6 +480,11 @@ fn doctor(config: &AppConfig) -> Result<(), CliError> {
 }
 
 async fn serve(config: &AppConfig) -> Result<(), CliError> {
+    let adapter = connect_neo4j(config).await?;
+    let experience_scope = ExperienceScope::new(
+        config.graph_namespace()?,
+        config.transcript_enrichment_mode()?.into(),
+    );
     let journal_path = config.journal_path()?;
     let journal = AppendOnlyJournal::open(&journal_path)?;
     let bind_address = config.bind_address()?;
@@ -338,9 +492,12 @@ async fn serve(config: &AppConfig) -> Result<(), CliError> {
         .await
         .map_err(|source| CliError::Server { source })?;
     tracing::info!(address = %bind_address, "live API listening");
-    axum::serve(listener, harness_graph_api::router(journal))
-        .await
-        .map_err(|source| CliError::Server { source })
+    axum::serve(
+        listener,
+        harness_graph_api::router_with_experience(journal, adapter, experience_scope),
+    )
+    .await
+    .map_err(|source| CliError::Server { source })
 }
 
 #[derive(Serialize)]
@@ -1758,6 +1915,12 @@ const fn import_failure_class(error: &CliError) -> ImportFailureClass {
         | CliError::TranscriptEnrichment(_)
         | CliError::TranscriptExecutionModeRequired
         | CliError::TranscriptDryRunBlocked { .. }
+        | CliError::TranscriptApplyPrecondition { .. }
+        | CliError::TranscriptPromptProvenance(_)
+        | CliError::EnrichmentApplication(_)
+        | CliError::TranscriptApplyWorkerJoin
+        | CliError::TranscriptApplyIncomplete
+        | CliError::BulkTranscriptApplyIncomplete
         | CliError::Planning(_)
         | CliError::Journal(_)
         | CliError::Server { .. }
@@ -1792,4 +1955,80 @@ fn initialize_logging() -> Result<(), CliError> {
         .map_err(|error| CliError::Logging {
             message: error.to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{Parser, error::ErrorKind};
+
+    use super::{Cli, Command, TranscriptExecutionMode};
+
+    #[test]
+    fn transcript_commands_require_exactly_one_execution_mode() {
+        let missing = Cli::try_parse_from([
+            "harness-graph",
+            "enrich-transcripts",
+            "--session-id",
+            "019c63db-2995-74c3-b898-c1b92a8e1317",
+            "--authorization",
+            "operator-test",
+        ]);
+        assert_eq!(
+            missing.err().map(|error| error.kind()),
+            Some(ErrorKind::MissingRequiredArgument)
+        );
+
+        let conflicting = Cli::try_parse_from([
+            "harness-graph",
+            "enrich-transcripts",
+            "--session-id",
+            "019c63db-2995-74c3-b898-c1b92a8e1317",
+            "--authorization",
+            "operator-test",
+            "--dry-run",
+            "--apply",
+        ]);
+        assert_eq!(
+            conflicting.err().map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test]
+    fn apply_flag_is_immediately_resolved_to_semantic_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from([
+            "harness-graph",
+            "enrich-transcripts",
+            "--session-id",
+            "019c63db-2995-74c3-b898-c1b92a8e1317",
+            "--authorization",
+            "operator-test",
+            "--apply",
+        ])?;
+        let Command::EnrichTranscripts { execution, .. } = cli.command else {
+            return Err("unexpected parsed command".into());
+        };
+        assert_eq!(execution.resolve()?, TranscriptExecutionMode::Apply);
+        Ok(())
+    }
+
+    #[test]
+    fn eligible_pilot_limit_is_bounded_at_the_cli_boundary() {
+        for invalid in ["0", "51"] {
+            let parsed = Cli::try_parse_from([
+                "harness-graph",
+                "enrich-all-transcripts",
+                "--authorization",
+                "operator-test",
+                "--apply",
+                "--limit",
+                invalid,
+            ]);
+            assert_eq!(
+                parsed.err().map(|error| error.kind()),
+                Some(ErrorKind::ValueValidation)
+            );
+        }
+    }
 }

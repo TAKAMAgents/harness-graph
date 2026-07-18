@@ -4,15 +4,40 @@ use harness_graph_assurance::AssuranceError;
 use harness_graph_classification::ClassificationError;
 use harness_graph_correlation::CorrelationError;
 use harness_graph_domain::DomainError;
+use harness_graph_enrichment_application::EnrichmentApplicationError;
 use harness_graph_event_journal::JournalError;
 use harness_graph_graph_port::GraphPortError;
 use harness_graph_ingestion::IngestionError;
-use harness_graph_mistral_adapter::MistralAdapterError;
+use harness_graph_mistral_adapter::{MistralAdapterError, TranscriptPromptProvenanceError};
 use harness_graph_neo4j_adapter::Neo4jAdapterError;
 use harness_graph_path_analysis::PathAnalysisError;
 use harness_graph_planning::PlanningError;
 use harness_graph_risk::RiskError;
 use harness_graph_transcript_enrichment::TranscriptEnrichmentError;
+
+/// Closed prerequisite for a cost-bearing transcript apply command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptApplyRequirement {
+    /// Enrichment remains default-off until explicitly enabled.
+    EnrichmentEnabled,
+    /// Mistral account training/data-sharing controls were operator-verified.
+    TrainingOptOutVerified,
+    /// A persistent dedicated HMAC key is available for stable pseudonyms.
+    StablePseudonymizationKey,
+    /// Transcript extraction uses the source-controlled pinned Mistral model.
+    PinnedMistralModel,
+}
+
+impl std::fmt::Display for TranscriptApplyRequirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::EnrichmentEnabled => "enrichment_enabled",
+            Self::TrainingOptOutVerified => "training_opt_out_verified",
+            Self::StablePseudonymizationKey => "stable_pseudonymization_key",
+            Self::PinnedMistralModel => "pinned_mistral_model",
+        })
+    }
+}
 
 /// Top-level command failure.
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +100,33 @@ pub enum CliError {
         /// Closed source-safe stage name.
         stage: &'static str,
     },
+
+    /// A cost-bearing apply precondition was not explicitly satisfied.
+    #[error("transcript apply blocked by prerequisite {requirement}")]
+    TranscriptApplyPrecondition {
+        /// Closed requirement name; no configuration value is retained.
+        requirement: TranscriptApplyRequirement,
+    },
+
+    /// Immutable prompt provenance could not be constructed locally.
+    #[error(transparent)]
+    TranscriptPromptProvenance(#[from] TranscriptPromptProvenanceError),
+
+    /// Additive transcript workflow composition failed source-safely.
+    #[error(transparent)]
+    EnrichmentApplication(#[from] EnrichmentApplicationError),
+
+    /// A blocking transcript preparation worker did not complete normally.
+    #[error("transcript preparation worker did not complete")]
+    TranscriptApplyWorkerJoin,
+
+    /// One-session apply produced a typed blocked or failed settlement.
+    #[error("transcript apply did not complete")]
+    TranscriptApplyIncomplete,
+
+    /// Bulk apply settled its selected sessions but retained failures or blocks.
+    #[error("bulk transcript apply completed with blocked or failed sessions")]
+    BulkTranscriptApplyIncomplete,
 
     /// Normalized execution-path derivation failed.
     #[error(transparent)]
