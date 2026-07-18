@@ -12,6 +12,7 @@ use harness_graph_neo4j_adapter::Neo4jAdapterError;
 use harness_graph_path_analysis::PathAnalysisError;
 use harness_graph_planning::PlanningError;
 use harness_graph_risk::RiskError;
+use harness_graph_transcript_enrichment::TranscriptEnrichmentError;
 
 /// Top-level command failure.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +60,21 @@ pub enum CliError {
     /// Deterministic risk derivation failed.
     #[error(transparent)]
     Risk(#[from] RiskError),
+
+    /// Transcript authorization, redaction, chunking, or validation failed.
+    #[error(transparent)]
+    TranscriptEnrichment(#[from] TranscriptEnrichmentError),
+
+    /// Transcript enrichment was invoked without selecting an explicit mode.
+    #[error("transcript enrichment requires an explicit --dry-run or --apply mode")]
+    TranscriptExecutionModeRequired,
+
+    /// A dry-run stage failed without disclosing a source path or transcript.
+    #[error("transcript dry run blocked at {stage}")]
+    TranscriptDryRunBlocked {
+        /// Closed source-safe stage name.
+        stage: &'static str,
+    },
 
     /// Normalized execution-path derivation failed.
     #[error(transparent)]

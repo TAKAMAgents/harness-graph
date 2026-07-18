@@ -138,6 +138,32 @@ fn doctor_reports_mistral_without_exposing_secrets() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn explicit_process_configuration_overrides_repository_file_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let working_directory = tempfile::tempdir()?;
+    std::fs::write(
+        working_directory.path().join(".env"),
+        "CODEX_SESSION_RAW_DATA_PATH=/deliberately/invalid\nMISTRAL_API_KEY=file-only-canary\n",
+    )?;
+    let output = command()?
+        .current_dir(working_directory.path())
+        .args(["discover", "--scope", "all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "environment override failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let rendered = String::from_utf8(output.stdout)?;
+    let result: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(result["unique_sessions"], 1);
+    assert!(!rendered.contains("file-only-canary"));
+    Ok(())
+}
+
+#[test]
 fn bulk_import_exposes_bounded_concurrency_contract() -> Result<(), Box<dyn std::error::Error>> {
     let help = command()?.args(["import-all", "--help"]).output()?;
     assert!(help.status.success());
@@ -171,6 +197,92 @@ fn archive_discovery_verification_and_streaming_are_end_to_end()
     assert_eq!(inspection["known_records"], 11);
     assert_eq!(inspection["quarantined_records"], 1);
     assert_eq!(inspection["total_records"], 12);
+    Ok(())
+}
+
+#[test]
+fn transcript_dry_run_scans_real_verified_fixture_without_external_clients()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut single = command()?;
+    single
+        .env("NEO4J_CONNECTION_URL", "deliberately-invalid")
+        .env("MISTRAL_MODEL", "not-a-mistral-model")
+        .env("MISTRAL_MAX_CONCURRENCY", "99")
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "disabled")
+        .env("HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL", "unverified")
+        .env_remove("HARNESS_GRAPH_REDACTION_HMAC_KEY")
+        .args([
+            "enrich-transcripts",
+            "--session-id",
+            SESSION_ID,
+            "--authorization",
+            "operator-e2e",
+            "--dry-run",
+        ]);
+    let output = single.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "single transcript dry run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let rendered = String::from_utf8(output.stdout)?;
+    let single_json: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(single_json["status"], "eligible");
+    assert_eq!(single_json["session_id"], SESSION_ID);
+    assert!(single_json["verified_records"].as_u64().unwrap_or_default() > 0);
+    assert!(single_json["expected_chunks"].as_u64().unwrap_or_default() > 0);
+    assert!(!rendered.contains("source-safe-test-key"));
+    assert!(!rendered.contains("source-safe-test-password"));
+    assert!(!rendered.contains("rollout.jsonl"));
+
+    let mut all = command()?;
+    all.env("NEO4J_CONNECTION_URL", "deliberately-invalid")
+        .env("MISTRAL_MODEL", "not-a-mistral-model")
+        .env("MISTRAL_MAX_CONCURRENCY", "99")
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "disabled")
+        .env("HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL", "unverified")
+        .env_remove("HARNESS_GRAPH_REDACTION_HMAC_KEY")
+        .args([
+            "enrich-all-transcripts",
+            "--scope",
+            "all",
+            "--authorization",
+            "operator-e2e",
+            "--dry-run",
+        ]);
+    let output = all.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "all transcript dry run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let rendered = String::from_utf8(output.stdout)?;
+    let all_json: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(all_json["status"], "dry_run_complete");
+    assert_eq!(all_json["discovered_sessions"], 1);
+    assert_eq!(all_json["eligible_sessions"], 1);
+    assert_eq!(all_json["blocks"]["scanner"], 0);
+    assert_eq!(
+        all_json["blocks"]["scanner_reasons"]["non_text_control_data"],
+        0
+    );
+    assert_eq!(
+        all_json["blocks"]["scanner_reasons"]["asset_or_binary_data"],
+        0
+    );
+    assert_eq!(
+        all_json["blocks"]["scanner_reasons"]["suspicious_encoded_blob"],
+        0
+    );
+    assert_eq!(all_json["external_provider_calls"], 0);
+    assert_eq!(all_json["neo4j_writes"], 0);
+    assert!(!rendered.contains("source-safe-test-key"));
+    assert!(!rendered.contains("source-safe-test-password"));
+    assert!(!rendered.contains("rollout.jsonl"));
     Ok(())
 }
 

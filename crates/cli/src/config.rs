@@ -7,161 +7,319 @@ use harness_graph_event_journal::JournalPath;
 use harness_graph_graph_port::BatchSize;
 use harness_graph_ingestion::ArchiveRoot;
 use harness_graph_mistral_adapter::{MistralConcurrencyLimit, MistralCredential, MistralModelName};
+use harness_graph_transcript_enrichment::{
+    EstimatedOutputTokensPerRequest, MicroUsd, PseudonymizationKey, SensitiveValue,
+    SensitiveValueSet, TokenRatePerMillion, TranscriptTokenPricing,
+};
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
 use crate::CliError;
 
-/// Complete validated runtime configuration.
+/// Lazily validated runtime configuration source.
+///
+/// Commands resolve only the capabilities they actually use. In particular,
+/// transcript inventory can inspect a verified archive without constructing a
+/// Neo4j or Mistral client.
 pub struct AppConfig {
-    archive_root: ArchiveRoot,
-    neo4j: Neo4jConnection,
-    graph_namespace: GraphNamespace,
-    graph_batch_size: BatchSize,
-    mistral_credential: MistralCredential,
-    mistral_model: MistralModelName,
-    mistral_concurrency: MistralConcurrencyLimit,
-    journal_path: JournalPath,
-    bind_address: SocketAddr,
+    values: ConfigurationFile,
 }
 
 impl AppConfig {
-    /// Load `.env` when present and validate all required settings.
+    /// Load `.env` when present without eagerly constructing unrelated clients.
     ///
     /// # Errors
     ///
-    /// Returns an error when required configuration is absent or invalid, or
-    /// when the configured archive root is not a directory.
+    /// Returns an error when the configuration file is unreadable or malformed.
     pub fn load() -> Result<Self, CliError> {
-        let file_values = ConfigurationFile::load_optional()?;
-        let archive_path = required_setting(&file_values, "CODEX_SESSION_RAW_DATA_PATH", &[])?;
-        let archive_root = ArchiveRoot::new(PathBuf::from(archive_path))?;
+        Ok(Self {
+            values: ConfigurationFile::load_optional()?,
+        })
+    }
+
+    /// Resolve the verified archive capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the archive setting is absent or invalid.
+    pub fn archive_root(&self) -> Result<ArchiveRoot, CliError> {
+        let archive_path = required_setting(&self.values, "CODEX_SESSION_RAW_DATA_PATH", &[])?;
+        Ok(ArchiveRoot::new(PathBuf::from(archive_path))?)
+    }
+
+    /// Resolve Neo4j connection settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required graph setting is absent or invalid.
+    pub fn neo4j(&self) -> Result<Neo4jConnection, CliError> {
         let neo4j_url = required_setting(
-            &file_values,
+            &self.values,
             "NEO4J_CONNECTION_URL",
             &["NEO4J_CONECTION_URL"],
         )?;
         let neo4j_password =
-            required_setting(&file_values, "NEO4J_PASSWORD", &["NEO4J_INATANSE_PASSWORD"])?;
+            required_setting(&self.values, "NEO4J_PASSWORD", &["NEO4J_INATANSE_PASSWORD"])?;
         let neo4j_username =
-            optional_setting(&file_values, "NEO4J_USERNAME").unwrap_or_else(|| "neo4j".to_owned());
+            optional_setting(&self.values, "NEO4J_USERNAME").unwrap_or_else(|| "neo4j".to_owned());
+        Neo4jConnection::new(&neo4j_url, &neo4j_username, neo4j_password)
+    }
+
+    /// Resolve the graph namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace violates its domain contract.
+    pub fn graph_namespace(&self) -> Result<GraphNamespace, CliError> {
         let graph_namespace = GraphNamespace::new(
-            optional_setting(&file_values, "HARNESS_GRAPH_NAMESPACE")
+            optional_setting(&self.values, "HARNESS_GRAPH_NAMESPACE")
                 .unwrap_or_else(|| "default".to_owned()),
         )?;
-        let graph_batch_size = optional_setting(&file_values, "HARNESS_GRAPH_BATCH_SIZE")
+        Ok(graph_namespace)
+    }
+
+    /// Resolve the bounded graph transaction size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured value is outside the graph port's
+    /// safety range.
+    pub fn graph_batch_size(&self) -> Result<BatchSize, CliError> {
+        optional_setting(&self.values, "HARNESS_GRAPH_BATCH_SIZE")
             .unwrap_or_else(|| "250".to_owned())
             .parse::<usize>()
             .map_err(|_| CliError::InvalidConfiguration {
                 canonical_name: "HARNESS_GRAPH_BATCH_SIZE",
                 reason: "expected an integer between 1 and 10,000",
             })
-            .and_then(|value| BatchSize::new(value).map_err(CliError::from))?;
-        let mistral_api_key =
-            required_setting(&file_values, "MISTRAL_API_KEY", &["MISTARL_API_KEY"])?;
-        let mistral_model = optional_setting(&file_values, "MISTRAL_MODEL")
+            .and_then(|value| BatchSize::new(value).map_err(CliError::from))
+    }
+
+    /// Resolve the Mistral credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical project credential is absent.
+    pub fn mistral_credential(&self) -> Result<MistralCredential, CliError> {
+        let key = required_setting(&self.values, "MISTRAL_API_KEY", &["MISTARL_API_KEY"])?;
+        Ok(MistralCredential::new(key)?)
+    }
+
+    /// Resolve the validated Mistral model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured model is not a Mistral family.
+    pub fn mistral_model(&self) -> Result<MistralModelName, CliError> {
+        let model = optional_setting(&self.values, "MISTRAL_MODEL")
             .unwrap_or_else(|| "mistral-small-latest".to_owned());
-        let mistral_concurrency = optional_setting(&file_values, "MISTRAL_MAX_CONCURRENCY")
+        Ok(MistralModelName::new(model)?)
+    }
+
+    /// Resolve the bounded Mistral concurrency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside the provider safety range.
+    pub fn mistral_concurrency(&self) -> Result<MistralConcurrencyLimit, CliError> {
+        optional_setting(&self.values, "MISTRAL_MAX_CONCURRENCY")
             .unwrap_or_else(|| "2".to_owned())
             .parse::<usize>()
             .map_err(|_| CliError::InvalidConfiguration {
                 canonical_name: "MISTRAL_MAX_CONCURRENCY",
                 reason: "expected an integer between 1 and 4",
             })
-            .and_then(|value| MistralConcurrencyLimit::new(value).map_err(CliError::from))?;
-        let journal_path = JournalPath::new(PathBuf::from(
-            optional_setting(&file_values, "HARNESS_GRAPH_JOURNAL_PATH")
+            .and_then(|value| MistralConcurrencyLimit::new(value).map_err(CliError::from))
+    }
+
+    /// Resolve the default-off transcript enrichment capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the value is the closed `disabled` or `enabled`
+    /// state.
+    pub fn transcript_enrichment_mode(&self) -> Result<TranscriptEnrichmentMode, CliError> {
+        match optional_setting(&self.values, "HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE")
+            .unwrap_or_else(|| "disabled".to_owned())
+            .as_str()
+        {
+            "disabled" => Ok(TranscriptEnrichmentMode::Disabled),
+            "enabled" => Ok(TranscriptEnrichmentMode::Enabled),
+            _ => Err(CliError::InvalidConfiguration {
+                canonical_name: "HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE",
+                reason: "expected disabled or enabled",
+            }),
+        }
+    }
+
+    /// Resolve the fail-closed Mistral privacy-control attestation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the value is a closed privacy state.
+    pub fn mistral_privacy_control(&self) -> Result<MistralPrivacyControl, CliError> {
+        match optional_setting(&self.values, "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL")
+            .unwrap_or_else(|| "unverified".to_owned())
+            .as_str()
+        {
+            "unverified" => Ok(MistralPrivacyControl::Unverified),
+            "training_opt_out_verified" => Ok(MistralPrivacyControl::TrainingOptOutVerified),
+            _ => Err(CliError::InvalidConfiguration {
+                canonical_name: "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL",
+                reason: "expected unverified or training_opt_out_verified",
+            }),
+        }
+    }
+
+    /// Resolve the dedicated local pseudonymization key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key is absent or weaker than the redaction
+    /// boundary permits.
+    pub fn pseudonymization_key(&self) -> Result<PseudonymizationKey, CliError> {
+        let key = required_setting(&self.values, "HARNESS_GRAPH_REDACTION_HMAC_KEY", &[])?;
+        Ok(PseudonymizationKey::new(key)?)
+    }
+
+    /// Collect configured credentials for exact local redaction without
+    /// constructing any provider or database client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured credential is too short to scan
+    /// reliably as an exact secret.
+    pub fn sensitive_values_for_redaction(&self) -> Result<SensitiveValueSet, CliError> {
+        let names = [
+            "MISTRAL_API_KEY",
+            "MISTARL_API_KEY",
+            "NEO4J_PASSWORD",
+            "NEO4J_INATANSE_PASSWORD",
+            "HARNESS_GRAPH_REDACTION_HMAC_KEY",
+        ];
+        let mut loaded_values = Vec::new();
+        for name in names {
+            for value in [optional_process_value(name), self.values.value(name)]
+                .into_iter()
+                .flatten()
+            {
+                if !loaded_values.contains(&value) {
+                    loaded_values.push(value);
+                }
+            }
+        }
+        let values = loaded_values
+            .into_iter()
+            .map(SensitiveValue::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SensitiveValueSet::new(values))
+    }
+
+    /// Resolve the pinned transcript extraction model independently from the
+    /// source-safe interpretation model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured model is not a Mistral family.
+    pub fn transcript_mistral_model(&self) -> Result<MistralModelName, CliError> {
+        let model = optional_setting(&self.values, "MISTRAL_TRANSCRIPT_MODEL")
+            .unwrap_or_else(|| "mistral-small-2603".to_owned());
+        Ok(MistralModelName::new(model)?)
+    }
+
+    /// Resolve the explicit regional pricing snapshot used by dry-run cost
+    /// estimation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either integer micro-USD rate is malformed.
+    pub fn transcript_token_pricing(&self) -> Result<TranscriptTokenPricing, CliError> {
+        let input = parse_u64_setting(
+            &self.values,
+            "HARNESS_GRAPH_TRANSCRIPT_INPUT_MICROUSD_PER_MILLION_TOKENS",
+            "165000",
+            "expected an integer micro-USD rate",
+        )?;
+        let output = parse_u64_setting(
+            &self.values,
+            "HARNESS_GRAPH_TRANSCRIPT_OUTPUT_MICROUSD_PER_MILLION_TOKENS",
+            "660000",
+            "expected an integer micro-USD rate",
+        )?;
+        Ok(TranscriptTokenPricing::new(
+            TokenRatePerMillion::new(MicroUsd::new(input)),
+            TokenRatePerMillion::new(MicroUsd::new(output)),
+        ))
+    }
+
+    /// Resolve the bounded expected output size for each map/reduce call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is malformed or outside the core bound.
+    pub fn transcript_estimated_output_tokens_per_request(
+        &self,
+    ) -> Result<EstimatedOutputTokensPerRequest, CliError> {
+        let value = parse_u64_setting(
+            &self.values,
+            "HARNESS_GRAPH_TRANSCRIPT_ESTIMATED_OUTPUT_TOKENS_PER_REQUEST",
+            "1024",
+            "expected an integer between 1 and 131072",
+        )?;
+        Ok(EstimatedOutputTokensPerRequest::new(value)?)
+    }
+
+    /// Resolve the durable live-event journal path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured journal path is invalid.
+    pub fn journal_path(&self) -> Result<JournalPath, CliError> {
+        Ok(JournalPath::new(PathBuf::from(
+            optional_setting(&self.values, "HARNESS_GRAPH_JOURNAL_PATH")
                 .unwrap_or_else(|| "data/live-events.jsonl".to_owned()),
-        ))?;
-        let bind_address = optional_setting(&file_values, "HARNESS_GRAPH_BIND_ADDRESS")
+        ))?)
+    }
+
+    /// Resolve the HTTP bind address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the address is not an explicit IP socket.
+    pub fn bind_address(&self) -> Result<SocketAddr, CliError> {
+        optional_setting(&self.values, "HARNESS_GRAPH_BIND_ADDRESS")
             .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
             .parse()
             .map_err(|_| CliError::InvalidConfiguration {
                 canonical_name: "HARNESS_GRAPH_BIND_ADDRESS",
                 reason: "expected an IP socket address such as 127.0.0.1:3000",
-            })?;
-
-        Ok(Self {
-            archive_root,
-            neo4j: Neo4jConnection::new(&neo4j_url, &neo4j_username, neo4j_password)?,
-            graph_namespace,
-            graph_batch_size,
-            mistral_credential: MistralCredential::new(mistral_api_key)?,
-            mistral_model: MistralModelName::new(mistral_model)?,
-            mistral_concurrency,
-            journal_path,
-            bind_address,
-        })
+            })
     }
+}
 
-    /// Verified archive root.
-    #[must_use]
-    pub const fn archive_root(&self) -> &ArchiveRoot {
-        &self.archive_root
-    }
+/// Closed operational state for paid transcript-provider work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptEnrichmentMode {
+    /// Local inventory is allowed, but no provider or graph enrichment call is.
+    Disabled,
+    /// Explicitly enabled for an authorized enrichment run.
+    Enabled,
+}
 
-    /// Neo4j connection settings.
-    #[must_use]
-    pub const fn neo4j(&self) -> &Neo4jConnection {
-        &self.neo4j
-    }
-
-    /// Namespace isolating this application's graph projection.
-    #[must_use]
-    pub const fn graph_namespace(&self) -> &GraphNamespace {
-        &self.graph_namespace
-    }
-
-    /// Maximum number of logical graph commands per transaction.
-    #[must_use]
-    pub const fn graph_batch_size(&self) -> BatchSize {
-        self.graph_batch_size
-    }
-
-    /// Mistral API key.
-    #[must_use]
-    pub const fn mistral_credential(&self) -> &MistralCredential {
-        &self.mistral_credential
-    }
-
-    /// Mistral model selection.
-    #[must_use]
-    pub const fn mistral_model(&self) -> &MistralModelName {
-        &self.mistral_model
-    }
-
-    /// Maximum simultaneous Mistral API calls in this process.
-    #[must_use]
-    pub const fn mistral_concurrency(&self) -> MistralConcurrencyLimit {
-        self.mistral_concurrency
-    }
-
-    /// Append-only live journal location.
-    #[must_use]
-    pub const fn journal_path(&self) -> &JournalPath {
-        &self.journal_path
-    }
-
-    /// HTTP bind address.
-    #[must_use]
-    pub const fn bind_address(&self) -> SocketAddr {
-        self.bind_address
-    }
+/// Attested Mistral account data-training state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MistralPrivacyControl {
+    /// Account privacy controls have not been verified; provider transfer blocks.
+    Unverified,
+    /// An operator verified that API training/data sharing is disabled.
+    TrainingOptOutVerified,
 }
 
 impl std::fmt::Debug for AppConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AppConfig")
-            .field("archive_root", &"[configured]")
-            .field("neo4j", &self.neo4j)
-            .field("graph_namespace", &self.graph_namespace)
-            .field("graph_batch_size", &self.graph_batch_size)
-            .field("mistral_credential", &"[redacted]")
-            .field("mistral_model", &self.mistral_model)
-            .field("mistral_concurrency", &self.mistral_concurrency)
-            .field("journal_path", &"[configured]")
-            .field("bind_address", &self.bind_address)
+            .field("values", &"[configured; secrets redacted]")
             .finish()
     }
 }
@@ -287,21 +445,21 @@ fn required_setting(
     canonical: &'static str,
     aliases: &[&str],
 ) -> Result<String, CliError> {
-    file.value(canonical)
-        .or_else(|| aliases.iter().find_map(|alias| file.value(alias)))
-        .or_else(|| optional_process_value(canonical))
+    optional_process_value(canonical)
+        .or_else(|| file.value(canonical))
         .or_else(|| {
             aliases
                 .iter()
                 .find_map(|alias| optional_process_value(alias))
         })
+        .or_else(|| aliases.iter().find_map(|alias| file.value(alias)))
         .ok_or(CliError::MissingConfiguration {
             canonical_name: canonical,
         })
 }
 
 fn optional_setting(file: &ConfigurationFile, name: &str) -> Option<String> {
-    file.value(name).or_else(|| optional_process_value(name))
+    optional_process_value(name).or_else(|| file.value(name))
 }
 
 fn optional_process_value(name: &str) -> Option<String> {
@@ -309,4 +467,130 @@ fn optional_process_value(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn parse_u64_setting(
+    file: &ConfigurationFile,
+    canonical_name: &'static str,
+    default_value: &'static str,
+    reason: &'static str,
+) -> Result<u64, CliError> {
+    optional_setting(file, canonical_name)
+        .unwrap_or_else(|| default_value.to_owned())
+        .parse::<u64>()
+        .map_err(|_| CliError::InvalidConfiguration {
+            canonical_name,
+            reason,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_capability_does_not_validate_unrelated_provider_settings() {
+        let config = AppConfig {
+            values: ConfigurationFile(vec![
+                (
+                    "CODEX_SESSION_RAW_DATA_PATH".to_owned(),
+                    env!("CARGO_MANIFEST_DIR").to_owned(),
+                ),
+                (
+                    "NEO4J_CONNECTION_URL".to_owned(),
+                    "not-a-neo4j-url".to_owned(),
+                ),
+                ("NEO4J_PASSWORD".to_owned(), "not-used".to_owned()),
+                ("MISTRAL_API_KEY".to_owned(), "not-used".to_owned()),
+                (
+                    "MISTRAL_MAX_CONCURRENCY".to_owned(),
+                    "outside-the-domain".to_owned(),
+                ),
+            ]),
+        };
+
+        assert!(config.archive_root().is_ok());
+        assert!(config.neo4j().is_err());
+        assert!(config.mistral_concurrency().is_err());
+    }
+
+    #[test]
+    fn debug_output_never_contains_configuration_values() {
+        let config = AppConfig {
+            values: ConfigurationFile(vec![(
+                "MISTRAL_API_KEY".to_owned(),
+                "must-never-be-rendered".to_owned(),
+            )]),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("must-never-be-rendered"));
+        assert_eq!(
+            rendered,
+            "AppConfig { values: \"[configured; secrets redacted]\" }"
+        );
+    }
+
+    #[test]
+    fn transcript_provider_work_is_disabled_and_privacy_blocked_by_default() {
+        let config = AppConfig {
+            values: ConfigurationFile(Vec::new()),
+        };
+
+        assert!(matches!(
+            config.transcript_enrichment_mode(),
+            Ok(TranscriptEnrichmentMode::Disabled)
+        ));
+        assert!(matches!(
+            config.mistral_privacy_control(),
+            Ok(MistralPrivacyControl::Unverified)
+        ));
+    }
+
+    #[test]
+    fn transcript_provider_work_requires_closed_explicit_states() {
+        let config = AppConfig {
+            values: ConfigurationFile(vec![
+                (
+                    "HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE".to_owned(),
+                    "enabled".to_owned(),
+                ),
+                (
+                    "HARNESS_GRAPH_MISTRAL_PRIVACY_CONTROL".to_owned(),
+                    "training_opt_out_verified".to_owned(),
+                ),
+            ]),
+        };
+
+        assert!(matches!(
+            config.transcript_enrichment_mode(),
+            Ok(TranscriptEnrichmentMode::Enabled)
+        ));
+        assert!(matches!(
+            config.mistral_privacy_control(),
+            Ok(MistralPrivacyControl::TrainingOptOutVerified)
+        ));
+    }
+
+    #[test]
+    fn redaction_secret_collection_is_source_safe_and_client_free()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = AppConfig {
+            values: ConfigurationFile(vec![
+                (
+                    "MISTRAL_API_KEY".to_owned(),
+                    "provider-secret-canary".to_owned(),
+                ),
+                (
+                    "NEO4J_PASSWORD".to_owned(),
+                    "database-secret-canary".to_owned(),
+                ),
+            ]),
+        };
+
+        let rendered = format!("{:?}", config.sensitive_values_for_redaction()?);
+        assert!(rendered.starts_with("SensitiveValueSet { count: "));
+        assert!(!rendered.contains("canary"));
+        Ok(())
+    }
 }

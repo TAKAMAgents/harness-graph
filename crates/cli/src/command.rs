@@ -29,6 +29,14 @@ use harness_graph_planning::{
     TaskClassificationRequest,
 };
 use harness_graph_risk::RiskEngine;
+use harness_graph_transcript_enrichment::{
+    AuthorizationIdentity, AuthorizationPolicyDigest, ChunkByteLimit, ChunkingPolicyVersion,
+    DisclosureAuthorization, EstimatedTokenLimit, FragmentByteLimit, LocalTranscriptRedactor,
+    PseudonymizationKey, RedactionCategory, RedactionCounts, RedactionPolicyVersion,
+    ScannerBlockReason, TranscriptChunkPolicy, TranscriptDisclosureScope,
+    TranscriptEnrichmentError, TranscriptInventoryEstimator, TranscriptPreparation,
+    TranscriptPreparationBlockReason, TranscriptPreparationLimits, prepare_verified_transcript,
+};
 use secrecy::SecretString;
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -57,6 +65,40 @@ pub async fn run() -> Result<(), CliError> {
         Command::Pathfinder { task, precedents } => pathfinder(&config, task, precedents).await,
         Command::Import { session_id } => import(&config, &session_id).await,
         Command::ImportAll { scope, concurrency } => import_all(&config, scope, concurrency).await,
+        Command::EnrichTranscripts {
+            session_id,
+            authorization,
+            disclosure_scope,
+            dry_run,
+        } => {
+            if dry_run {
+                enrich_transcripts_dry_run(
+                    &config,
+                    &session_id,
+                    authorization,
+                    disclosure_scope.into(),
+                )
+            } else {
+                Err(CliError::TranscriptExecutionModeRequired)
+            }
+        }
+        Command::EnrichAllTranscripts {
+            scope,
+            authorization,
+            disclosure_scope,
+            dry_run,
+        } => {
+            if dry_run {
+                enrich_all_transcripts_dry_run(
+                    &config,
+                    scope.into(),
+                    authorization,
+                    disclosure_scope.into(),
+                )
+            } else {
+                Err(CliError::TranscriptExecutionModeRequired)
+            }
+        }
         Command::Serve => serve(&config).await,
     }
 }
@@ -144,6 +186,36 @@ enum Command {
         #[arg(long, default_value_t = ImportConcurrencyLimit::default())]
         concurrency: ImportConcurrencyLimit,
     },
+    /// Inventory one authorized transcript without contacting Mistral or Neo4j.
+    EnrichTranscripts {
+        /// Stable session UUID.
+        #[arg(long)]
+        session_id: String,
+        /// Source-safe identity for the explicit disclosure authorization.
+        #[arg(long)]
+        authorization: String,
+        /// Closed transcript disclosure scope.
+        #[arg(long, value_enum, default_value_t = DisclosureScopeArgument::ConversationAndExecution)]
+        disclosure_scope: DisclosureScopeArgument,
+        /// Perform only local verification, scanning, chunk estimation, and reporting.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inventory every transcript in an archive scope without external mutation.
+    EnrichAllTranscripts {
+        /// Archive scope.
+        #[arg(long, value_enum, default_value_t = ScopeArgument::All)]
+        scope: ScopeArgument,
+        /// Source-safe identity for the explicit disclosure authorization.
+        #[arg(long)]
+        authorization: String,
+        /// Closed transcript disclosure scope.
+        #[arg(long, value_enum, default_value_t = DisclosureScopeArgument::ConversationAndExecution)]
+        disclosure_scope: DisclosureScopeArgument,
+        /// Perform only local verification, scanning, chunk estimation, and reporting.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Serve durable live ingestion, replay, and server-sent events.
     Serve,
 }
@@ -154,6 +226,21 @@ enum ScopeArgument {
     Active,
     Archived,
     All,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DisclosureScopeArgument {
+    ConversationOnly,
+    ConversationAndExecution,
+}
+
+impl From<DisclosureScopeArgument> for TranscriptDisclosureScope {
+    fn from(value: DisclosureScopeArgument) -> Self {
+        match value {
+            DisclosureScopeArgument::ConversationOnly => Self::ConversationOnly,
+            DisclosureScopeArgument::ConversationAndExecution => Self::ConversationAndExecution,
+        }
+    }
 }
 
 /// Bounded number of session projections that may advance concurrently.
@@ -227,10 +314,10 @@ struct CredentialStatus {
 }
 
 fn doctor(config: &AppConfig) -> Result<(), CliError> {
-    let _archive = config.archive_root();
-    let _neo4j = config.neo4j();
-    let _mistral_credential = config.mistral_credential();
-    let _journal_path = config.journal_path();
+    let _archive = config.archive_root()?;
+    let _neo4j = config.neo4j()?;
+    let _mistral_credential = config.mistral_credential()?;
+    let _journal_path = config.journal_path()?;
     write_json(&DoctorOutput {
         status: "ready",
         archive: "configured",
@@ -244,11 +331,13 @@ fn doctor(config: &AppConfig) -> Result<(), CliError> {
 }
 
 async fn serve(config: &AppConfig) -> Result<(), CliError> {
-    let journal = AppendOnlyJournal::open(config.journal_path())?;
-    let listener = tokio::net::TcpListener::bind(config.bind_address())
+    let journal_path = config.journal_path()?;
+    let journal = AppendOnlyJournal::open(&journal_path)?;
+    let bind_address = config.bind_address()?;
+    let listener = tokio::net::TcpListener::bind(bind_address)
         .await
         .map_err(|source| CliError::Server { source })?;
-    tracing::info!(address = %config.bind_address(), "live API listening");
+    tracing::info!(address = %bind_address, "live API listening");
     axum::serve(listener, harness_graph_api::router(journal))
         .await
         .map_err(|source| CliError::Server { source })
@@ -269,7 +358,7 @@ struct SessionOutput {
 }
 
 fn discover(config: &AppConfig, scope: SessionScope, limit: usize) -> Result<(), CliError> {
-    let catalog = config.archive_root().discover(scope)?;
+    let catalog = config.archive_root()?.discover(scope)?;
     let sessions = catalog
         .iter()
         .take(limit)
@@ -296,7 +385,7 @@ struct VerificationOutput {
 
 fn verify(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     let session_id = SessionId::parse(session_id)?;
-    let catalog = config.archive_root().discover(SessionScope::All)?;
+    let catalog = config.archive_root()?.discover(SessionScope::All)?;
     let verified = catalog.require(session_id)?.verify()?;
     write_json(&VerificationOutput {
         status: "verified",
@@ -317,7 +406,7 @@ struct InspectionOutput {
 
 fn inspect(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     let session_id = SessionId::parse(session_id)?;
-    let catalog = config.archive_root().discover(SessionScope::All)?;
+    let catalog = config.archive_root()?.discover(SessionScope::All)?;
     let verified = catalog.require(session_id)?.verify()?;
     let receipt = inspect_bundle(verified)?;
     write_json(&InspectionOutput {
@@ -327,6 +416,453 @@ fn inspect(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
         quarantined_records: receipt.quarantined_records.value(),
         total_records: receipt.total_records.value(),
     })
+}
+
+const TRANSCRIPT_DISCLOSURE_POLICY: &[u8] =
+    b"harness-graph/conversation-and-execution-disclosure/v1";
+const TRANSCRIPT_REDACTION_POLICY_VERSION: &str = "redaction-v1";
+const TRANSCRIPT_CHUNKING_POLICY_VERSION: &str = "chunking-v1";
+const TRANSCRIPT_CHUNK_BYTES: usize = 24 * 1_024;
+const TRANSCRIPT_FRAGMENT_BYTES: usize = 8 * 1_024;
+const TRANSCRIPT_ESTIMATED_TOKENS: u64 = 8 * 1_024;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TranscriptDryRunSessionStatus {
+    Eligible,
+    MetadataOnly,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TranscriptDryRunBlockReasonOutput {
+    None,
+    ScannerNonTextControlData,
+    ScannerAssetOrBinaryData,
+    ScannerSuspiciousEncodedBlob,
+    SanitizedByteLimitExceeded,
+    FragmentLimitExceeded,
+    ChunkLimitExceeded,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct RedactionCountOutput {
+    known_secret: u64,
+    private_key: u64,
+    authentication_material: u64,
+    credential_url: u64,
+    provider_token: u64,
+    high_entropy_assignment: u64,
+    email: u64,
+    phone: u64,
+    ip_address: u64,
+    home_path: u64,
+}
+
+impl RedactionCountOutput {
+    fn from_counts(counts: &RedactionCounts) -> Self {
+        Self {
+            known_secret: counts.count(RedactionCategory::KnownSecret).value(),
+            private_key: counts.count(RedactionCategory::PrivateKey).value(),
+            authentication_material: counts
+                .count(RedactionCategory::AuthenticationMaterial)
+                .value(),
+            credential_url: counts.count(RedactionCategory::CredentialUrl).value(),
+            provider_token: counts.count(RedactionCategory::ProviderToken).value(),
+            high_entropy_assignment: counts
+                .count(RedactionCategory::HighEntropyAssignment)
+                .value(),
+            email: counts.count(RedactionCategory::Email).value(),
+            phone: counts.count(RedactionCategory::Phone).value(),
+            ip_address: counts.count(RedactionCategory::IpAddress).value(),
+            home_path: counts.count(RedactionCategory::HomePath).value(),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.known_secret = self.known_secret.saturating_add(other.known_secret);
+        self.private_key = self.private_key.saturating_add(other.private_key);
+        self.authentication_material = self
+            .authentication_material
+            .saturating_add(other.authentication_material);
+        self.credential_url = self.credential_url.saturating_add(other.credential_url);
+        self.provider_token = self.provider_token.saturating_add(other.provider_token);
+        self.high_entropy_assignment = self
+            .high_entropy_assignment
+            .saturating_add(other.high_entropy_assignment);
+        self.email = self.email.saturating_add(other.email);
+        self.phone = self.phone.saturating_add(other.phone);
+        self.ip_address = self.ip_address.saturating_add(other.ip_address);
+        self.home_path = self.home_path.saturating_add(other.home_path);
+    }
+}
+
+#[derive(Serialize)]
+struct TranscriptDryRunSessionOutput {
+    status: TranscriptDryRunSessionStatus,
+    block_reason: TranscriptDryRunBlockReasonOutput,
+    session_id: String,
+    source_digest: String,
+    verified_records: u64,
+    projected_fragments: u64,
+    excluded_records: u64,
+    scope_excluded_fragments: u64,
+    sanitized_fragments: u64,
+    sanitized_bytes: u64,
+    expected_chunks: u64,
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
+    estimated_cost_microusd: u64,
+    expected_api_calls: u64,
+    redactions: RedactionCountOutput,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct TranscriptDryRunScannerBlockCounts {
+    non_text_control_data: u64,
+    asset_or_binary_data: u64,
+    suspicious_encoded_blob: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct TranscriptDryRunBlockCounts {
+    integrity: u64,
+    scanner: u64,
+    scanner_reasons: TranscriptDryRunScannerBlockCounts,
+    preparation: u64,
+}
+
+#[derive(Serialize)]
+struct TranscriptDryRunAllOutput {
+    status: &'static str,
+    discovered_sessions: u64,
+    eligible_sessions: u64,
+    metadata_only_sessions: u64,
+    blocked_sessions: u64,
+    verified_records: u64,
+    projected_fragments: u64,
+    sanitized_fragments: u64,
+    sanitized_bytes: u64,
+    expected_chunks: u64,
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
+    estimated_cost_microusd: u64,
+    expected_api_calls: u64,
+    blocks: TranscriptDryRunBlockCounts,
+    redactions: RedactionCountOutput,
+    external_provider_calls: u64,
+    neo4j_writes: u64,
+}
+
+#[derive(Default)]
+struct TranscriptDryRunAggregate {
+    discovered_sessions: u64,
+    eligible_sessions: u64,
+    metadata_only_sessions: u64,
+    verified_records: u64,
+    projected_fragments: u64,
+    sanitized_fragments: u64,
+    sanitized_bytes: u64,
+    expected_chunks: u64,
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
+    estimated_cost_microusd: u64,
+    expected_api_calls: u64,
+    blocks: TranscriptDryRunBlockCounts,
+    redactions: RedactionCountOutput,
+}
+
+impl TranscriptDryRunAggregate {
+    fn include(&mut self, session: &TranscriptDryRunSessionOutput) {
+        match session.status {
+            TranscriptDryRunSessionStatus::Eligible => {
+                self.eligible_sessions = self.eligible_sessions.saturating_add(1);
+            }
+            TranscriptDryRunSessionStatus::MetadataOnly => {
+                self.metadata_only_sessions = self.metadata_only_sessions.saturating_add(1);
+            }
+            TranscriptDryRunSessionStatus::Blocked => match session.block_reason {
+                TranscriptDryRunBlockReasonOutput::ScannerNonTextControlData => {
+                    self.blocks.scanner = self.blocks.scanner.saturating_add(1);
+                    self.blocks.scanner_reasons.non_text_control_data = self
+                        .blocks
+                        .scanner_reasons
+                        .non_text_control_data
+                        .saturating_add(1);
+                }
+                TranscriptDryRunBlockReasonOutput::ScannerAssetOrBinaryData => {
+                    self.blocks.scanner = self.blocks.scanner.saturating_add(1);
+                    self.blocks.scanner_reasons.asset_or_binary_data = self
+                        .blocks
+                        .scanner_reasons
+                        .asset_or_binary_data
+                        .saturating_add(1);
+                }
+                TranscriptDryRunBlockReasonOutput::ScannerSuspiciousEncodedBlob => {
+                    self.blocks.scanner = self.blocks.scanner.saturating_add(1);
+                    self.blocks.scanner_reasons.suspicious_encoded_blob = self
+                        .blocks
+                        .scanner_reasons
+                        .suspicious_encoded_blob
+                        .saturating_add(1);
+                }
+                TranscriptDryRunBlockReasonOutput::SanitizedByteLimitExceeded
+                | TranscriptDryRunBlockReasonOutput::FragmentLimitExceeded
+                | TranscriptDryRunBlockReasonOutput::ChunkLimitExceeded
+                | TranscriptDryRunBlockReasonOutput::None => {
+                    self.blocks.preparation = self.blocks.preparation.saturating_add(1);
+                }
+            },
+        }
+        self.verified_records = self
+            .verified_records
+            .saturating_add(session.verified_records);
+        self.projected_fragments = self
+            .projected_fragments
+            .saturating_add(session.projected_fragments);
+        self.sanitized_fragments = self
+            .sanitized_fragments
+            .saturating_add(session.sanitized_fragments);
+        self.sanitized_bytes = self.sanitized_bytes.saturating_add(session.sanitized_bytes);
+        self.expected_chunks = self.expected_chunks.saturating_add(session.expected_chunks);
+        self.estimated_input_tokens = self
+            .estimated_input_tokens
+            .saturating_add(session.estimated_input_tokens);
+        self.estimated_output_tokens = self
+            .estimated_output_tokens
+            .saturating_add(session.estimated_output_tokens);
+        self.estimated_cost_microusd = self
+            .estimated_cost_microusd
+            .saturating_add(session.estimated_cost_microusd);
+        self.expected_api_calls = self
+            .expected_api_calls
+            .saturating_add(session.expected_api_calls);
+        self.redactions.merge(session.redactions);
+    }
+
+    const fn blocked_sessions(&self) -> u64 {
+        self.blocks
+            .integrity
+            .saturating_add(self.blocks.scanner)
+            .saturating_add(self.blocks.preparation)
+    }
+}
+
+fn enrich_transcripts_dry_run(
+    config: &AppConfig,
+    session_id: &str,
+    authorization: String,
+    disclosure_scope: TranscriptDisclosureScope,
+) -> Result<(), CliError> {
+    let session_id = SessionId::parse(session_id)?;
+    let catalog = config.archive_root()?.discover(SessionScope::All)?;
+    let verified =
+        catalog
+            .require(session_id)?
+            .verify()
+            .map_err(|_| CliError::TranscriptDryRunBlocked {
+                stage: "archive_integrity",
+            })?;
+    let redactor = dry_run_redactor(config)?;
+    let policy = transcript_chunk_policy()?;
+    let estimator = transcript_inventory_estimator(config)?;
+    let authorization_identity = AuthorizationIdentity::new(authorization)?;
+    let output = transcript_dry_run_session(
+        verified,
+        &authorization_identity,
+        disclosure_scope,
+        &redactor,
+        &policy,
+        &estimator,
+    )
+    .map_err(|error| CliError::TranscriptDryRunBlocked {
+        stage: transcript_dry_run_stage(&error),
+    })?;
+    write_json(&output)
+}
+
+fn enrich_all_transcripts_dry_run(
+    config: &AppConfig,
+    scope: SessionScope,
+    authorization: String,
+    disclosure_scope: TranscriptDisclosureScope,
+) -> Result<(), CliError> {
+    let catalog = config.archive_root()?.discover(scope)?;
+    let redactor = dry_run_redactor(config)?;
+    let policy = transcript_chunk_policy()?;
+    let estimator = transcript_inventory_estimator(config)?;
+    let authorization_identity = AuthorizationIdentity::new(authorization)?;
+    let mut aggregate = TranscriptDryRunAggregate {
+        discovered_sessions: u64::try_from(catalog.len()).unwrap_or(u64::MAX),
+        ..TranscriptDryRunAggregate::default()
+    };
+    for bundle in catalog.iter() {
+        let Ok(verified) = bundle.verify() else {
+            aggregate.blocks.integrity = aggregate.blocks.integrity.saturating_add(1);
+            continue;
+        };
+        match transcript_dry_run_session(
+            verified,
+            &authorization_identity,
+            disclosure_scope,
+            &redactor,
+            &policy,
+            &estimator,
+        ) {
+            Ok(session) => aggregate.include(&session),
+            Err(_) => {
+                aggregate.blocks.preparation = aggregate.blocks.preparation.saturating_add(1);
+            }
+        }
+    }
+    write_json(&TranscriptDryRunAllOutput {
+        status: "dry_run_complete",
+        discovered_sessions: aggregate.discovered_sessions,
+        eligible_sessions: aggregate.eligible_sessions,
+        metadata_only_sessions: aggregate.metadata_only_sessions,
+        blocked_sessions: aggregate.blocked_sessions(),
+        verified_records: aggregate.verified_records,
+        projected_fragments: aggregate.projected_fragments,
+        sanitized_fragments: aggregate.sanitized_fragments,
+        sanitized_bytes: aggregate.sanitized_bytes,
+        expected_chunks: aggregate.expected_chunks,
+        estimated_input_tokens: aggregate.estimated_input_tokens,
+        estimated_output_tokens: aggregate.estimated_output_tokens,
+        estimated_cost_microusd: aggregate.estimated_cost_microusd,
+        expected_api_calls: aggregate.expected_api_calls,
+        blocks: aggregate.blocks,
+        redactions: aggregate.redactions,
+        external_provider_calls: 0,
+        neo4j_writes: 0,
+    })
+}
+
+fn transcript_dry_run_session(
+    verified: VerifiedSessionBundle,
+    authorization_identity: &AuthorizationIdentity,
+    disclosure_scope: TranscriptDisclosureScope,
+    redactor: &LocalTranscriptRedactor,
+    policy: &TranscriptChunkPolicy,
+    estimator: &TranscriptInventoryEstimator,
+) -> Result<TranscriptDryRunSessionOutput, TranscriptEnrichmentError> {
+    let session_id = verified.session_id();
+    let source_digest = verified.source_digest();
+    let authorization = DisclosureAuthorization::new(
+        session_id,
+        source_digest,
+        disclosure_scope,
+        AuthorizationPolicyDigest::hash(TRANSCRIPT_DISCLOSURE_POLICY),
+        authorization_identity.clone(),
+        harness_graph_domain::OccurredAt::now_utc(),
+    );
+    let preparation = prepare_verified_transcript(
+        verified,
+        &authorization,
+        redactor,
+        policy,
+        harness_graph_ingestion::MaxSourceRecordBytes::default(),
+        TranscriptPreparationLimits::default(),
+    )?;
+    let estimate = estimator.estimate(&preparation);
+    let (status, block_reason, inventory, redactions) = match &preparation {
+        TranscriptPreparation::Prepared(prepared) => (
+            TranscriptDryRunSessionStatus::Eligible,
+            TranscriptDryRunBlockReasonOutput::None,
+            prepared.inventory(),
+            RedactionCountOutput::from_counts(prepared.inventory().redaction_counts()),
+        ),
+        TranscriptPreparation::MetadataOnly(inventory) => (
+            TranscriptDryRunSessionStatus::MetadataOnly,
+            TranscriptDryRunBlockReasonOutput::None,
+            inventory,
+            RedactionCountOutput::from_counts(inventory.redaction_counts()),
+        ),
+        TranscriptPreparation::Blocked(blocked) => (
+            TranscriptDryRunSessionStatus::Blocked,
+            match blocked.reason() {
+                TranscriptPreparationBlockReason::ScannerRejected { reason, .. } => match reason {
+                    ScannerBlockReason::NonTextControlData => {
+                        TranscriptDryRunBlockReasonOutput::ScannerNonTextControlData
+                    }
+                    ScannerBlockReason::AssetOrBinaryData => {
+                        TranscriptDryRunBlockReasonOutput::ScannerAssetOrBinaryData
+                    }
+                    ScannerBlockReason::SuspiciousEncodedBlob => {
+                        TranscriptDryRunBlockReasonOutput::ScannerSuspiciousEncodedBlob
+                    }
+                },
+                TranscriptPreparationBlockReason::SanitizedByteLimitExceeded => {
+                    TranscriptDryRunBlockReasonOutput::SanitizedByteLimitExceeded
+                }
+                TranscriptPreparationBlockReason::FragmentLimitExceeded => {
+                    TranscriptDryRunBlockReasonOutput::FragmentLimitExceeded
+                }
+                TranscriptPreparationBlockReason::ChunkLimitExceeded => {
+                    TranscriptDryRunBlockReasonOutput::ChunkLimitExceeded
+                }
+            },
+            blocked.inventory(),
+            RedactionCountOutput::from_counts(blocked.inventory().redaction_counts()),
+        ),
+    };
+    Ok(TranscriptDryRunSessionOutput {
+        status,
+        block_reason,
+        session_id: session_id.to_string(),
+        source_digest: source_digest.to_hex(),
+        verified_records: inventory.total_records().value(),
+        projected_fragments: inventory.projected_fragments().value(),
+        excluded_records: inventory.excluded_records().value(),
+        scope_excluded_fragments: inventory.scope_excluded_fragments().value(),
+        sanitized_fragments: inventory.sanitized_fragments().value(),
+        sanitized_bytes: inventory.sanitized_bytes().value(),
+        expected_chunks: estimate.chunk_count().value(),
+        estimated_input_tokens: estimate.estimated_input_tokens().value(),
+        estimated_output_tokens: estimate.estimated_output_tokens().value(),
+        estimated_cost_microusd: estimate.estimated_cost().value(),
+        expected_api_calls: estimate.request_count().value(),
+        redactions,
+    })
+}
+
+fn dry_run_redactor(config: &AppConfig) -> Result<LocalTranscriptRedactor, CliError> {
+    let ephemeral_key = format!(
+        "dry-run-{}{}",
+        uuid::Uuid::now_v7().simple(),
+        uuid::Uuid::now_v7().simple()
+    );
+    Ok(LocalTranscriptRedactor::new(
+        RedactionPolicyVersion::new(TRANSCRIPT_REDACTION_POLICY_VERSION)?,
+        PseudonymizationKey::new(ephemeral_key)?,
+        config.sensitive_values_for_redaction()?,
+    )?)
+}
+
+fn transcript_chunk_policy() -> Result<TranscriptChunkPolicy, CliError> {
+    Ok(TranscriptChunkPolicy::new(
+        ChunkByteLimit::new(TRANSCRIPT_CHUNK_BYTES)?,
+        EstimatedTokenLimit::new(TRANSCRIPT_ESTIMATED_TOKENS)?,
+        FragmentByteLimit::new(TRANSCRIPT_FRAGMENT_BYTES)?,
+        ChunkingPolicyVersion::new(TRANSCRIPT_CHUNKING_POLICY_VERSION)?,
+    )?)
+}
+
+fn transcript_inventory_estimator(
+    config: &AppConfig,
+) -> Result<TranscriptInventoryEstimator, CliError> {
+    Ok(TranscriptInventoryEstimator::new(
+        config.transcript_token_pricing()?,
+        config.transcript_estimated_output_tokens_per_request()?,
+    ))
+}
+
+const fn transcript_dry_run_stage(error: &TranscriptEnrichmentError) -> &'static str {
+    match error {
+        TranscriptEnrichmentError::ScannerBlocked { .. } => "local_scanner",
+        TranscriptEnrichmentError::Ingestion(_) => "canonical_transcript_projection",
+        _ => "transcript_preparation",
+    }
 }
 
 #[derive(Serialize)]
@@ -563,7 +1099,7 @@ fn analyze(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
 
 fn analyze_session(config: &AppConfig, session_id: &str) -> Result<SessionAnalysis, CliError> {
     let session_id = SessionId::parse(session_id)?;
-    let catalog = config.archive_root().discover(SessionScope::All)?;
+    let catalog = config.archive_root()?.discover(SessionScope::All)?;
     let verified = catalog.require(session_id)?.verify()?;
     let source_digest = verified.source_digest();
     let expected_records = verified.expected_records();
@@ -783,8 +1319,9 @@ async fn pathfinder(config: &AppConfig, task: String, precedents: usize) -> Resu
     let context = PlanningContext::new(TaskBrief::new(task)?);
     let adapter = connect_neo4j(config).await?;
     adapter.health().await?;
+    let namespace = config.graph_namespace()?;
     let precedents = adapter
-        .verified_precedents(config.graph_namespace(), PrecedentLimit::new(precedents)?)
+        .verified_precedents(&namespace, PrecedentLimit::new(precedents)?)
         .await?;
     let retrieved_precedents = precedents.count().value();
     let mistral = mistral_adapter(config)?;
@@ -821,10 +1358,11 @@ async fn pathfinder(config: &AppConfig, task: String, precedents: usize) -> Resu
 }
 
 fn mistral_adapter(config: &AppConfig) -> Result<RigMistralAdapter, CliError> {
+    let credential = config.mistral_credential()?;
     Ok(RigMistralAdapter::with_concurrency(
-        config.mistral_credential(),
-        config.mistral_model().clone(),
-        config.mistral_concurrency(),
+        &credential,
+        config.mistral_model()?,
+        config.mistral_concurrency()?,
     )?)
 }
 
@@ -853,15 +1391,15 @@ struct SessionImportReceipt {
 
 async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     let session_id = SessionId::parse(session_id)?;
-    let catalog = config.archive_root().discover(SessionScope::All)?;
+    let catalog = config.archive_root()?.discover(SessionScope::All)?;
     let verified = catalog.require(session_id)?.verify()?;
     let adapter = connect_neo4j(config).await?;
     adapter.health().await?;
     adapter.ensure_schema().await?;
     match import_verified_session(config, &adapter, verified).await? {
         SessionImportResult::Imported(receipt) => {
-            let observations_in_namespace =
-                adapter.observation_count(config.graph_namespace()).await?;
+            let namespace = config.graph_namespace()?;
+            let observations_in_namespace = adapter.observation_count(&namespace).await?;
             write_json(&ImportOutput {
                 status: "imported",
                 session_id: receipt.session_id.to_string(),
@@ -878,8 +1416,8 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
             source_digest,
             expected_records,
         } => {
-            let observations_in_namespace =
-                adapter.observation_count(config.graph_namespace()).await?;
+            let namespace = config.graph_namespace()?;
+            let observations_in_namespace = adapter.observation_count(&namespace).await?;
             write_json(&AlreadyCompleteImportOutput {
                 status: "already_complete",
                 session_id: session_id.to_string(),
@@ -896,7 +1434,7 @@ async fn import_all(
     scope: ScopeArgument,
     concurrency: ImportConcurrencyLimit,
 ) -> Result<(), CliError> {
-    let catalog = config.archive_root().discover(scope.into())?;
+    let catalog = config.archive_root()?.discover(scope.into())?;
     let adapter = connect_neo4j(config).await?;
     adapter.health().await?;
     adapter.ensure_schema().await?;
@@ -959,7 +1497,8 @@ async fn import_all(
     }
     sessions.sort_by(|left, right| left.session_id().cmp(right.session_id()));
 
-    let observations_in_namespace = adapter.observation_count(config.graph_namespace()).await?;
+    let namespace = config.graph_namespace()?;
+    let observations_in_namespace = adapter.observation_count(&namespace).await?;
     let has_failures = !failed_sessions.is_zero();
     let status = if has_failures {
         BulkImportStatus::CompletedWithFailures
@@ -1022,7 +1561,8 @@ async fn import_verified_session(
     let session_id = verified.session_id();
     let source_digest = verified.source_digest();
     let expected_records = verified.expected_records();
-    let namespace = config.graph_namespace().clone();
+    let namespace = config.graph_namespace()?;
+    let graph_batch_size = config.graph_batch_size()?;
 
     // Source receipts are content-addressed, while session provenance is not.
     // Always materialize the idempotent session-to-source edge before using a
@@ -1072,7 +1612,7 @@ async fn import_verified_session(
             adapter,
             std::mem::replace(&mut pending, PendingBatch::Empty),
             command,
-            config.graph_batch_size(),
+            graph_batch_size,
         )
         .await?;
     }
@@ -1126,7 +1666,7 @@ async fn import_verified_session(
 }
 
 async fn connect_neo4j(config: &AppConfig) -> Result<Neo4jAdapter, CliError> {
-    let neo4j = config.neo4j();
+    let neo4j = config.neo4j()?;
     Ok(Neo4jAdapter::connect(
         &neo4j.bolt_address()?,
         neo4j.username(),
@@ -1215,6 +1755,9 @@ const fn import_failure_class(error: &CliError) -> ImportFailureClass {
         CliError::ImportWorkerJoin => ImportFailureClass::WorkerJoin,
         CliError::BulkImportIncomplete
         | CliError::Mistral(_)
+        | CliError::TranscriptEnrichment(_)
+        | CliError::TranscriptExecutionModeRequired
+        | CliError::TranscriptDryRunBlocked { .. }
         | CliError::Planning(_)
         | CliError::Journal(_)
         | CliError::Server { .. }

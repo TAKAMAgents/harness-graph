@@ -153,6 +153,12 @@ impl TokenCount {
 pub struct OccurredAt(OffsetDateTime);
 
 impl OccurredAt {
+    /// Capture the current UTC timestamp at an operational boundary.
+    #[must_use]
+    pub fn now_utc() -> Self {
+        Self(OffsetDateTime::now_utc())
+    }
+
     /// Parse an RFC 3339 timestamp.
     ///
     /// # Errors
