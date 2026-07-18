@@ -27,6 +27,15 @@ The governing principle:
 
 > **Harnesses report facts. Rust enforces meaning. Neo4j stores experience. Mistral interprets ambiguity. Evidence decides success.**
 
+The authoritative-layer invariant is stricter:
+
+> **Deterministic extraction is the immutable base graph. Mistral enrichment is
+> additive, versioned, provenance-marked, and evidence-linked. It never replaces,
+> rewrites, deletes, or upgrades a deterministic fact.**
+
+If enrichment is unavailable, invalid, incomplete, or later removed, the verified
+deterministic graph must remain complete and queryable exactly as before.
+
 ---
 
 # 1. Actual Codex export contract
@@ -69,6 +78,9 @@ The other representations have narrower roles:
 * `timeline.jsonl` may be used as a sequence/count oracle, but cannot drive the
   graph because it omits native payloads;
 * `transcript.md`, HTML, and assets must not be imported by default;
+* opt-in transcript enrichment reconstructs typed textual fragments from the
+  checksum-verified `raw/rollout.jsonl`; it does not treat `transcript.md` as a
+  second semantic source or copy that rendered file into the graph;
 * remote asset references must never be fetched automatically.
 
 ## Discovery snapshot
@@ -167,6 +179,19 @@ Verified session bundle
                    Better future execution
 ```
 
+The experience graph has two compositionally separate layers:
+
+```text
+verified canonical records ── deterministic Rust morphisms ── authoritative graph
+
+verified transcript text ── local disclosure/redaction gate ── Mistral
+                         ── citation validator ── versioned enrichment subgraph
+```
+
+Only the second path may contain model interpretation. No command produced by
+that path can mutate an authoritative node, relationship, key, status, outcome,
+risk, assurance result, ingestion receipt, or evidence edge.
+
 ---
 
 # 3. Rust workspace
@@ -180,6 +205,7 @@ harness-graph/
 │   ├── ingestion/
 │   ├── correlation/
 │   ├── classification/
+│   ├── transcript-enrichment/
 │   ├── assurance/
 │   ├── risk/
 │   ├── path-analysis/
@@ -276,6 +302,32 @@ The archive is sensitive local data:
 * project allowlisted, redacted properties into Neo4j;
 * represent payload evidence with a digest and typed source reference;
 * use source-safe golden fixtures captured from real records for tests.
+
+Raw-transcript enrichment is an explicit, opt-in external-processing boundary,
+not an exception to quarantine. The source archive remains read-only. Raw text
+may exist only transiently inside the typed transcript reader and local scanner;
+the provider input must be a bounded `LocallySanitizedFragment`. Raw or sanitized
+prompt bodies must never be written to this repository, Neo4j, the event journal,
+temporary files, stdout, stderr, tracing, telemetry, or error bodies.
+
+The default disclosure scope is `ConversationAndExecution`: user and agent
+messages plus textual tool requests/results, commands, patches, errors,
+verification output, and completion summaries. System/developer instruction
+bodies, hidden reasoning, assets, binary/base64 bodies, credentials, session
+tokens, and suspicious high-entropy values are excluded. Instruction-bearing
+context requires a separate future opt-in; remote assets remain forbidden.
+
+Mandatory local scanning removes secrets even when raw-transcript processing is
+authorized. It detects loaded credential values without logging them, private
+keys, bearer/JWT/cookie material, credential URLs, common provider-token formats,
+high-entropy assignments, emails, phone numbers, user names, customer identifiers,
+IP addresses, and absolute home paths. Stable pseudonyms use a local keyed digest;
+scanner uncertainty fails the session closed.
+
+The raw transcript itself is never edited. If the exporter publishes different
+canonical bytes, the changed source digest creates a new `SourceSnapshot` and a
+new enrichment run. Knowledge can therefore be refreshed without rewriting
+historical evidence.
 
 They are forbidden inside:
 
@@ -588,6 +640,26 @@ PlanStep
 Cluster
 ```
 
+## Versioned semantic enrichment
+
+These nodes are a non-authoritative overlay. Their implementation labels use the
+existing `HG` prefix, but they remain separate from deterministic graph commands:
+
+```text
+EnrichmentRun
+TranscriptSpan
+NarrativeEpisode
+KnowledgeEntity
+KnowledgeClaim
+KnowledgeRelation
+EnrichmentView
+```
+
+`TranscriptSpan` stores only a source digest, record-sequence/field-path anchor,
+role/kind, byte/token counts, and content digest. It never stores raw transcript
+text. `EnrichmentView` is the only mutable enrichment-only selector; it may point
+to the latest fully completed run without changing any base node.
+
 ---
 
 # 9. Core relationships
@@ -674,6 +746,34 @@ CandidatePlan-[:SUPPORTED_BY]->Run
 CandidatePlan-[:AVOIDS]->PathPattern
 PlanStep-[:REALIZED_AS]->Activity
 ```
+
+## Additive enrichment
+
+```text
+SourceSnapshot-[:HAS_ENRICHMENT_RUN]->EnrichmentRun
+EnrichmentRun-[:PRODUCED_EPISODE]->NarrativeEpisode
+EnrichmentRun-[:PRODUCED_CLAIM]->KnowledgeClaim
+EnrichmentRun-[:PRODUCED_ENTITY]->KnowledgeEntity
+EnrichmentRun-[:PRODUCED_RELATION]->KnowledgeRelation
+
+NarrativeEpisode-[:CITES_ACTIVITY]->Activity
+NarrativeEpisode-[:NEXT_EPISODE]->NarrativeEpisode
+KnowledgeClaim-[:SUPPORTED_BY]->TranscriptSpan
+KnowledgeClaim-[:ABOUT]->KnowledgeEntity
+KnowledgeClaim-[:CORROBORATED_BY]->Observation
+KnowledgeRelation-[:SUBJECT]->KnowledgeEntity
+KnowledgeRelation-[:OBJECT]->KnowledgeEntity
+KnowledgeRelation-[:SUPPORTED_BY]->TranscriptSpan
+TranscriptSpan-[:FROM_SOURCE]->SourceSnapshot
+TranscriptSpan-[:MAPS_TO]->Observation
+EnrichmentView-[:SELECTS]->EnrichmentRun
+```
+
+Model-supplied semantic relations are reified as `KnowledgeRelation` nodes with
+a closed predicate enum. Mistral cannot create arbitrary Neo4j labels,
+relationship types, Cypher, IDs, source references, or base-graph commands.
+Reification keeps provider/model/prompt/schema provenance and citations attached
+to every assertion instead of hiding mutable interpretation in edge properties.
 
 ---
 
@@ -889,7 +989,7 @@ edit after failed check    → Repair
 permission request         → RequestPermission
 ```
 
-## Mistral only for ambiguity
+## Mistral only for interpretation and additive enrichment
 
 Use Mistral through Rig for:
 
@@ -899,14 +999,21 @@ Use Mistral through Rig for:
 * root-cause hypothesis;
 * activity summarization;
 * semantic similarity explanation;
+* transcript-derived knowledge claims and entities;
+* evidence-linked semantic relations;
 * candidate-plan generation.
 
 Implemented task classification consumes only a validated source-safe
 `TaskBrief` and returns a closed `TaskCategory`, coarse semantic confidence,
 and bounded explanation. It does not replace the deterministic activity
-classifier. Unclear command purpose and custom-script intent remain pending
-until the ingestion boundary can produce a source-safe invocation synopsis;
-raw invocation text will not be sent merely to complete those bullets.
+classifier. That existing path remains source-safe.
+
+The new transcript-enrichment path may read meaningful raw conversation and
+execution text from the verified canonical rollout under an explicit disclosure
+authorization. It must pass the text through the local secret/PII scanner before
+provider transfer, preserve exact source anchors, and store only validated,
+paraphrased semantic output. This opt-in path does not permit raw invocation text
+to enter the base classifier, graph, logs, fixtures, or repository.
 
 Use strict structured output:
 
@@ -983,6 +1090,154 @@ calls to settle instead of cancelling a sibling on first failure. Each branch
 uses one model turn, deterministic sampling parameters, and a 90-second bound.
 Only two independently validated values form `SynchronizedInterpretation`;
 classification and extraction usage remain separately attributable.
+
+## Raw-transcript knowledge enrichment boundary
+
+### Category-theory framing
+
+The deterministic graph and enrichment graph are separate categories. The
+enrichment functor maps verified transcript spans and deterministic activities to
+versioned semantic assertions while preserving evidence citations:
+
+```text
+VerifiedSessionBundle
+  → SensitiveTranscriptFragment
+  → LocallySanitizedFragment
+  → BoundedTranscriptChunk
+  → MistralStructuredClaims
+  → CitationValidatedEnrichment
+  → AdditiveEnrichmentGraphCommand
+```
+
+Each fallible or asynchronous morphism composes through a typed `Result`. The
+identity operation is an unchanged source plus unchanged disclosure, redaction,
+chunking, provider, model, prompt, and output-schema versions. A change to any of
+those objects creates a new parallel run; it never updates the old run or base
+graph. Selecting a completed run for display is a read-layer natural
+transformation, not a mutation of authoritative objects.
+
+### Typed disclosure and lifecycle
+
+Raw strings and unvalidated maps cannot cross the boundary. Required types
+include:
+
+```text
+TranscriptDisclosureScope
+DisclosureAuthorization
+SensitiveTranscriptFragment
+LocallySanitizedFragment
+TranscriptChunkId
+TranscriptSpanRef
+RedactionReceipt
+RedactionPolicyVersion
+ChunkingPolicyVersion
+EnrichmentRunId
+EnrichmentFingerprint
+EnrichmentSchemaVersion
+PromptVersion
+KnowledgeKind
+KnowledgeConfidence
+EpistemicStatus
+KnowledgeClaim
+KnowledgeEntity
+KnowledgePredicate
+KnowledgeRelation
+EvidenceCitation
+EnrichmentRunStatus
+```
+
+`EnrichmentRunStatus` is a closed state machine:
+
+```text
+Planned → Scanned → Submitted → Validated → Projected → Completed
+            └────→ Blocked
+                       Submitted → RetryableFailed | TerminalFailed
+                       Validated → TerminalFailed
+                       Projected → TerminalFailed
+Completed → Superseded
+```
+
+Only `Completed` runs are query-visible. A partial or failed run cannot become
+selected, cannot affect ingestion receipts, and cannot hide a previous completed
+enrichment.
+
+### Extraction contract
+
+Mistral is the only foundation-model provider. The implementation reads the exact
+`MISTRAL_API_KEY` from the project environment, validates that `MISTRAL_MODEL` is
+a Mistral-hosted non-Labs model, and uses Rig only inside the infrastructure
+adapter. Transcript text is quoted as untrusted evidence, never interpreted as
+instructions; the request exposes no tools and accepts only native JSON-schema
+structured output.
+
+Closed knowledge kinds include goal, decision, constraint, artifact, dependency,
+failure, root-cause hypothesis, repair, verification, risk, lesson, and open
+question. Closed relation predicates include `USES`, `MODIFIES`, `DEPENDS_ON`,
+`CAUSES`, `BLOCKED_BY`, `RESOLVES`, `VERIFIES`, `PRODUCES`, `CONTRIBUTES_TO`,
+`CONTRADICTS`, and `RELATED_TO`.
+
+Every claim and relation must cite one or more supplied transcript-span tokens.
+Rust rejects unknown, missing, duplicated, conflicting, or out-of-scope citations;
+empty/oversized text; unknown enum values; invalid relation endpoints; copied
+secret patterns; and unsupported causal certainty. A Mistral causal statement is
+a model inference until a deterministic observation explicitly corroborates it.
+Mistral can never determine or override an outcome, risk, assurance result,
+verification status, source identity, or activity status.
+
+### Chunking, parallelism, and reduction
+
+The reader streams `raw/rollout.jsonl` in bounded memory, preserves record and
+turn boundaries, and redacts before chunking. Oversized textual fields split only
+at safe UTF-8 paragraph boundaries; redaction placeholders never split. Each
+fragment receives an opaque citation token derived from its typed source record,
+field path, and part index.
+
+Independent chunk extractions run concurrently behind the existing typed Mistral
+semaphore (`MISTRAL_MAX_CONCURRENCY`, validated in the existing range of one to
+four; default two) and settle all results. Session consolidation runs only after
+all chunk outputs validate and receives validated claims rather than raw
+transcript text. Classification and transcript extraction run concurrently when
+independent, but projection waits for both required branches to settle.
+
+The enrichment fingerprint is content-addressed from:
+
+```text
+namespace
++ source digest
++ transcript projection digest
++ disclosure scope and authorization policy digest
++ redaction policy version
++ chunking policy version
++ provider and model
++ prompt version/digest
++ output schema version
+```
+
+An exact completed fingerprint is a no-op. Chunk receipts allow retry to resume
+without repeating validated cost-bearing calls. Only typed transient `429`, `5xx`,
+timeout, or transport failures retry with bounded backoff and `Retry-After`;
+privacy, checksum, scanner, schema, citation, secret-echo, or model-family
+failures stop closed.
+
+### Privacy and provider mode
+
+The command is disabled by default and requires a versioned
+`DisclosureAuthorization` naming session/archive scope, disclosure scope, policy
+digest, and authorization identity/time. A dry run reports only eligible/blocked
+session counts, redaction-category counts, chunk/token estimates, expected API
+calls, and cost estimate—never text, paths, or credentials.
+
+The initial implementation uses stateless Mistral chat completions through the EU
+regional endpoint and verifies the account's training/retention controls before
+the first real raw-transcript call. It does not use Files, Agents, Conversations,
+feedback APIs, or stateful Batch processing. Batch may be evaluated only as a
+later explicit data-governance decision because the EU regional endpoint does not
+provide the stateful Batch/Files APIs.
+
+No request/response-body logging is allowed. Provider errors are wrapped before
+they can echo request content. The persisted run records only model/version
+metadata, token/cost usage, timestamps, status, source/chunk counts, redaction
+category counts, and citation-safe semantic output.
 
 ---
 
@@ -1604,6 +1859,147 @@ classification and extraction usage. The same test verifies the provider/model
 boundary, closed classification enums, explanation bound, and concurrency of
 two without asserting brittle wall-clock speed or exposing raw payloads.
 
+## Phase 3A: additive raw-transcript knowledge enrichment
+
+This phase expands semantic meaning without changing Phase 0–3 output. Its
+first regression assertion snapshots the deterministic nodes, relationships,
+keys, properties, outcomes, risks, receipts, and evidence before enrichment;
+the same snapshot must remain logically identical afterward.
+
+### Milestone 3A.0: governance and dry-run inventory
+
+Deliver:
+
+```text
+typed disclosure scope and authorization
+default-off transcript-enrichment configuration
+EU stateless Mistral transport policy
+privacy-control preflight
+enrich-transcripts --dry-run
+enrich-all-transcripts --dry-run
+eligible/blocked session and token/cost inventory
+```
+
+Default scope is `ConversationAndExecution`; instruction bodies, hidden reasoning,
+assets, binary content, and secrets remain excluded. The dry run must cover all
+1,369 currently verified sessions without provider or Neo4j mutation and mark
+metadata-only sessions as typed skips.
+
+E2E gate: a real verified archive scan proves checksums, scope selection, bounded
+memory, source-safe reporting, and zero Mistral/Neo4j writes. Commit and push this
+milestone only after the focused tests and E2E pass.
+
+### Milestone 3A.1: typed transcript extraction
+
+Deliver:
+
+```text
+streaming canonical-text extractor
+closed textual record classes
+source sequence + field-path + role/turn/call anchors
+oversized/binary/asset rejection
+deterministic bounded chunker
+opaque citation tokens
+```
+
+E2E gate: real temporary copies of captured source-safe records cover ordinary,
+multi-turn, multi-agent, tool, command, patch, error, Unicode, huge-field, and
+prompt-injection cases without using `transcript.md` as semantic input. Commit
+and push only after focused tests and E2E pass.
+
+### Milestone 3A.2: mandatory local redaction
+
+Deliver:
+
+```text
+secret and PII scanner
+local keyed stable pseudonyms
+typed redaction receipts
+scanner-uncertainty blocker
+safe Debug and source-safe errors
+provider-body logging prohibition
+```
+
+E2E gate: canary credentials, private keys, tokens, credential URLs, emails,
+phones, IPs, home paths, user/customer identifiers, and high-entropy assignments
+are absent from approved chunks, logs, CLI output, errors, and every Neo4j string
+property. Scanner failure blocks the session. Commit and push only after focused
+tests and E2E pass.
+
+### Milestone 3A.3: Mistral structured extraction
+
+Deliver:
+
+```text
+Mistral-only structured-output DTOs
+closed knowledge/entity/predicate enums
+bounded concurrent chunk map calls
+validated-claim reduction without raw transcript replay
+citation, size, endpoint, confidence, and secret-echo validation
+typed usage/cost attribution
+retry and all-results-settle behavior
+```
+
+E2E gate: one explicitly authorized, non-sensitive real session travels through
+the real Mistral API using the project's `MISTRAL_API_KEY`; every returned claim
+and relation resolves to supplied citations, transcript text is treated only as
+data, and no request body appears in output or telemetry. A contract-faithful
+local HTTP server separately proves timeout, `429`, `5xx`, malformed-schema, and
+prompt-echo error semantics without mocks. Commit and push only after focused
+tests and E2E pass.
+
+### Milestone 3A.4: additive Neo4j projection and API
+
+Deliver:
+
+```text
+new enrichment-only uniqueness constraints and indexes
+HGEnrichmentRun + HGTranscriptSpan
+HGNarrativeEpisode + HGKnowledgeEntity
+HGKnowledgeClaim + HGKnowledgeRelation + HGEnrichmentView
+separate EnrichmentGraphCommand/EnrichmentProjector boundary
+latest-completed enrichment query with deterministic fallback
+citation-aware enriched API response
+```
+
+The model output must never enter the existing deterministic `GraphCommand`
+family. UI/API labels use enrichment display fields when a completed run is
+selected and otherwise fall back to deterministic kind/status; internal `key`
+properties are never repurposed as human labels.
+
+E2E gate: a real Neo4j run performs `import → enrich → query`, proves the full
+base-graph snapshot unchanged, resolves every citation, hides partial runs,
+repeats the identical fingerprint as a no-op, and creates a parallel version
+when model/prompt/schema/redaction/chunking policy changes. Commit and push only
+after focused tests and E2E pass.
+
+### Milestone 3A.5: pilot, bounded backfill, and enriched UI
+
+Rollout order:
+
+```text
+one reviewed low-risk session
+→ 10-session settlement
+→ 50-session settlement
+→ all eligible verified sessions
+→ identical full rerun proving every completed fingerprint is skipped
+```
+
+Use bounded session/chunk concurrency, checkpoint only completed chunk/run
+transactions, settle every session, and exit nonzero when any session is blocked
+or fails. Reconcile request, token, and cost totals. Failed or partial enrichment
+leaves the base graph and previous selected enrichment untouched.
+
+The UI adds semantic title, summary, entity/claim/relation views, confidence and
+epistemic-status badges, provider/model/prompt-version provenance, and clickable
+source citation anchors. Authorized local source resolution may display an
+excerpt on demand; raw transcript text is never stored in Neo4j.
+
+E2E gate: the real Mistral + real Neo4j full workflow proves resumability,
+idempotency, all-results-settle behavior, stable deterministic counts, no secret
+or raw-text persistence, and deterministic UI fallback. Commit and push only
+after all focused, workspace, security, and E2E checks pass.
+
 ## Phase 4: risk and assurance
 
 Deliver:
@@ -1845,6 +2241,15 @@ OpenCode begins working and the graph grows live.
 [x] Low-level events become semantic activities.
 [x] Mistral task classification uses a closed source-safe structured-output boundary.
 [x] Mistral classification and narrative extraction run concurrently and synchronize.
+[ ] Transcript enrichment is opt-in and reads only checksum-verified canonical rollouts.
+[ ] Local scanning removes secrets and PII before any raw-transcript provider transfer.
+[ ] Mistral receives bounded, cited transcript chunks only through the typed sensitive boundary.
+[ ] Every enrichment claim and relation cites resolvable source spans.
+[ ] Enrichment creates only versioned overlay nodes and edges; deterministic graph state is unchanged.
+[ ] Identical enrichment fingerprints are no-ops; changed versions create parallel runs.
+[ ] Partial or failed enrichment never becomes selected and never changes ingestion success.
+[ ] Real Mistral and real Neo4j E2E tests prove import, enrich, query, retry, and resumability.
+[ ] A full eligible-session backfill and identical rerun settle with reconciled usage and zero duplicates.
 [x] Neo4j reconstructs the full execution path.
 [x] Neo4j projection uses uniqueness constraints, bounded batches, and checkpoints.
 [ ] The UI shows timeline, graph, context, and assurance.
@@ -1869,6 +2274,7 @@ Import
 → Deduplicate
 → Correlate
 → Project
+→ Enrich additively
 → Visualize
 → Evaluate
 → Profile
@@ -1879,4 +2285,4 @@ Import
 
 For the hackathon, the critical spine is:
 
-> **Your real Codex session becomes a context-aware Neo4j execution graph, then a Mistral-powered Pathfinder uses that graph to help the next coding agent avoid failed paths and reuse verified ones.**
+> **Your real Codex session becomes an authoritative deterministic Neo4j execution graph, Mistral adds a separate evidence-linked knowledge layer, and Pathfinder uses both without ever replacing verified facts.**
