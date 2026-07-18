@@ -13,6 +13,6 @@ pub use observation::{
     UnsupportedNativeRecord,
 };
 pub use value::{
-    NativeCallId, NativeRecordKind, OccurredAt, RecordCount, RecordSequence, SessionId, ToolName,
-    TurnId,
+    GraphNamespace, NativeCallId, NativeRecordKind, ObservationId, OccurredAt, RecordCount,
+    RecordSequence, SessionId, ToolName, TurnId,
 };

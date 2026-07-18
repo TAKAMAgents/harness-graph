@@ -6,6 +6,61 @@ use uuid::Uuid;
 
 use crate::DomainError;
 
+/// Logical graph namespace isolating independent imports and E2E runs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GraphNamespace(String);
+
+impl GraphNamespace {
+    /// Construct a validated graph namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace is empty or contains characters
+    /// outside ASCII letters, digits, hyphen, and underscore.
+    pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(DomainError::EmptyValue {
+                field: "graph namespace",
+            });
+        }
+        if !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(DomainError::InvalidGraphNamespace);
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    /// Borrow the namespace.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Stable graph identity for one observation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ObservationId(String);
+
+impl ObservationId {
+    /// Derive identity from a verified source digest and record sequence.
+    #[must_use]
+    pub fn from_source(source_digest: crate::SourceDigest, sequence: RecordSequence) -> Self {
+        Self(format!("{}:{}", source_digest.to_hex(), sequence.value()))
+    }
+
+    /// Borrow the graph identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Stable Codex session identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -141,3 +196,22 @@ non_empty_string_type!(NativeCallId, "native call identifier");
 non_empty_string_type!(NativeRecordKind, "native record kind");
 non_empty_string_type!(ToolName, "tool name");
 non_empty_string_type!(TurnId, "turn identifier");
+
+#[cfg(test)]
+mod tests {
+    use super::GraphNamespace;
+
+    #[test]
+    fn graph_namespace_rejects_cypher_and_separator_characters() {
+        for invalid in ["", "tenant:one", "tenant one", "tenant.one", "tenant/$one"] {
+            assert!(GraphNamespace::new(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn graph_namespace_accepts_source_safe_identifiers() -> Result<(), Box<dyn std::error::Error>> {
+        let namespace = GraphNamespace::new("tenant_01-e2e")?;
+        assert_eq!(namespace.as_str(), "tenant_01-e2e");
+        Ok(())
+    }
+}

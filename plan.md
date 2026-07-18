@@ -1709,26 +1709,26 @@ OpenCode begins working and the graph grows live.
 # 25. Definition of done
 
 ```text
-[ ] The archive root is resolved from typed configuration, not hardcoded.
-[ ] Only published active/archived session bundles are discovered.
-[ ] Metadata and checksums are validated before parsing.
-[ ] Canonical raw rollouts stream without whole-session buffering.
-[ ] Historical raw data is referenced, not copied into this repository.
+[x] The archive root is resolved from typed configuration, not hardcoded.
+[x] Only published active/archived session bundles are discovered.
+[x] Metadata and checksums are validated before parsing.
+[x] Canonical raw rollouts stream without whole-session buffering.
+[x] Historical raw data is referenced, not copied into this repository.
 [ ] Live events are stored in an append-only journal.
-[ ] Known native record families parse into typed variants.
-[ ] Unknown native variants are quarantined, counted, and source-referenced.
-[ ] Active/archived relocation does not duplicate a session.
-[ ] Re-importing an unchanged source is an identity/no-op operation.
-[ ] Context snapshots are content-addressed and deduplicated.
-[ ] Volatile assertion identity is excluded from semantic context hashes.
-[ ] No serde_json::Value escapes the protocol boundary.
-[ ] Every domain ID is a distinct newtype.
+[x] Known native record families parse into typed variants.
+[x] Unknown native variants are quarantined, counted, and source-referenced.
+[x] Active/archived relocation does not duplicate a session.
+[x] Re-importing an unchanged source is an identity/no-op operation.
+[x] Context snapshots are content-addressed and deduplicated.
+[x] Volatile assertion identity is excluded from semantic context hashes.
+[x] No serde_json::Value escapes the protocol boundary.
+[x] Every domain ID is a distinct newtype.
 [ ] Every graph edge has an allowed source and target type.
 [ ] Tool calls and results correlate by native ID.
 [ ] Pending, interrupted, and orphaned tool-call states are preserved.
 [ ] Low-level events become semantic activities.
 [ ] Neo4j reconstructs the full execution path.
-[ ] Neo4j projection uses uniqueness constraints, bounded batches, and checkpoints.
+[x] Neo4j projection uses uniqueness constraints, bounded batches, and checkpoints.
 [ ] The UI shows timeline, graph, context, and assurance.
 [ ] Outcomes are determined from evidence.
 [ ] Risks link to concrete supporting observations.
@@ -1736,10 +1736,10 @@ OpenCode begins working and the graph grows live.
 [ ] Pathfinder uses typed tools rather than raw Cypher.
 [ ] Candidate plans cite supporting runs.
 [ ] OpenCode can append events in real time.
-[ ] Raw transcripts, instruction bodies, assets, and absolute paths are never committed.
-[ ] Remote asset references are never fetched automatically.
-[ ] Tests use real captured fixtures and full-boundary validation, not mocks.
-[ ] No unwrap, expect, panic, or untyped domain strings.
+[x] Raw transcripts, instruction bodies, assets, and absolute paths are never committed.
+[x] Remote asset references are never fetched automatically.
+[x] Tests use real captured fixtures and full-boundary validation, not mocks.
+[x] No unwrap, expect, panic, or untyped domain strings.
 ```
 
 # Final implementation order

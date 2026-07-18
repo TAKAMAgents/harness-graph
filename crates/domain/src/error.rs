@@ -32,4 +32,8 @@ pub enum DomainError {
         #[source]
         source: time::error::Parse,
     },
+
+    /// A graph namespace contained unsupported characters.
+    #[error("graph namespace may contain only ASCII letters, digits, hyphen, and underscore")]
+    InvalidGraphNamespace,
 }

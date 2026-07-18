@@ -101,6 +101,38 @@ pub enum ObservationKind {
     TaskCompleted,
 }
 
+impl ObservationKind {
+    /// Stable graph/property representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionMetadataAsserted => "session_metadata_asserted",
+            Self::ContextAsserted => "context_asserted",
+            Self::TaskStarted => "task_started",
+            Self::TurnStarted => "turn_started",
+            Self::TurnAborted => "turn_aborted",
+            Self::TurnCompleted => "turn_completed",
+            Self::UserMessageReceived => "user_message_received",
+            Self::AgentMessageReceived => "agent_message_received",
+            Self::ToolRequested => "tool_requested",
+            Self::ToolCompleted => "tool_completed",
+            Self::CommandCompleted => "command_completed",
+            Self::PatchApplied => "patch_applied",
+            Self::TokenUsageObserved => "token_usage_observed",
+            Self::ThreadSettingsApplied => "thread_settings_applied",
+            Self::GoalUpdated => "goal_updated",
+            Self::ContextCompacted => "context_compacted",
+            Self::ThreadRolledBack => "thread_rolled_back",
+            Self::WorldStateAsserted => "world_state_asserted",
+            Self::SubAgentActivityObserved => "sub_agent_activity_observed",
+            Self::InterAgentMessageObserved => "inter_agent_message_observed",
+            Self::ErrorObserved => "error_observed",
+            Self::VerificationCompleted => "verification_completed",
+            Self::TaskCompleted => "task_completed",
+        }
+    }
+}
+
 /// Relationship between an observation and semantic execution context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "context", content = "digest", rename_all = "snake_case")]
@@ -285,6 +317,18 @@ impl UnsupportedNativeRecord {
     #[must_use]
     pub const fn native_kind(&self) -> &NativeRecordKind {
         &self.native_kind
+    }
+
+    /// Occurrence timestamp.
+    #[must_use]
+    pub const fn occurred_at(&self) -> OccurredAt {
+        self.occurred_at
+    }
+
+    /// Redacted payload digest.
+    #[must_use]
+    pub const fn payload_digest(&self) -> PayloadDigest {
+        self.payload_digest
     }
 }
 

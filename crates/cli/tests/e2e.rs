@@ -12,6 +12,7 @@ fn fixture_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn command() -> Result<Command, Box<dyn std::error::Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_harness-graph"));
     command
+        .current_dir(std::env::temp_dir())
         .env("CODEX_SESSION_RAW_DATA_PATH", fixture_root()?)
         .env("NEO4J_CONNECTION_URL", "neo4j://127.0.0.1:7687")
         .env("NEO4J_USERNAME", "neo4j")

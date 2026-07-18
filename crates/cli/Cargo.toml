@@ -14,11 +14,14 @@ path = "src/main.rs"
 clap.workspace = true
 dotenvy.workspace = true
 harness-graph-domain = { path = "../domain" }
+harness-graph-graph-port = { path = "../graph-port" }
 harness-graph-ingestion = { path = "../ingestion" }
+harness-graph-neo4j-adapter = { path = "../neo4j-adapter" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true

@@ -24,7 +24,38 @@ The implementation contract is maintained in [`plan.md`](plan.md).
 
 Copy `.env.example` to `.env` and provide the required values. Canonical names
 are documented in that file. The runtime also accepts the existing misspelled
-local aliases without logging their values.
+local aliases without logging their values. When a project `.env` exists, its
+canonical names and aliases are resolved before inherited process variables;
+this prevents unrelated workstation-wide Neo4j settings from silently taking
+precedence. Run commands from a neutral working directory to use process-only
+configuration.
+
+## Historical import
+
+Inspect a verified bundle without touching Neo4j:
+
+```bash
+cargo run -p harness-graph-cli -- inspect --session-id <uuid>
+```
+
+Project it into Neo4j:
+
+```bash
+cargo run -p harness-graph-cli -- import --session-id <uuid>
+```
+
+The importer validates the complete checksum manifest first, streams canonical
+records in bounded transactions, creates idempotent uniqueness constraints,
+and writes a completion receipt only after the streamed count matches verified
+metadata. Repeating the same import preserves one observation per source
+digest and sequence. `HARNESS_GRAPH_NAMESPACE` isolates graph populations and
+`HARNESS_GRAPH_BATCH_SIZE` controls the validated transaction bound.
+
+The current projection stores source/session provenance, observations,
+quarantined variants, content-addressed contexts, turns, tool calls, tools, and
+ingestion receipts. Semantic activities, assurance/risk findings, path
+profiles, and visualization are subsequent vertical slices tracked in
+[`plan.md`](plan.md).
 
 ## Development commands
 
@@ -34,6 +65,13 @@ just lint
 just test
 just e2e
 just check
+```
+
+The live Neo4j contract test is opt-in and uses the configured local instance:
+
+```bash
+cargo test -p harness-graph-neo4j-adapter \
+  live_neo4j_projection_is_idempotent -- --ignored
 ```
 
 Detailed architecture, commands, migration procedures, observability, and

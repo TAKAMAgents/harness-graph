@@ -1,11 +1,17 @@
 //! CLI error boundary.
 
 use harness_graph_domain::DomainError;
+use harness_graph_graph_port::GraphPortError;
 use harness_graph_ingestion::IngestionError;
+use harness_graph_neo4j_adapter::Neo4jAdapterError;
 
 /// Top-level command failure.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    /// The selected `.env` file could not be read or parsed safely.
+    #[error("project .env file is unreadable or malformed")]
+    ConfigurationFile,
+
     /// Required configuration was absent.
     #[error("required configuration {canonical_name} is missing")]
     MissingConfiguration {
@@ -29,6 +35,14 @@ pub enum CliError {
     /// Archive ingestion failed.
     #[error(transparent)]
     Ingestion(#[from] IngestionError),
+
+    /// Graph projection configuration failed validation.
+    #[error(transparent)]
+    GraphPort(#[from] GraphPortError),
+
+    /// Neo4j connectivity, schema, or projection failed.
+    #[error(transparent)]
+    Neo4j(#[from] Neo4jAdapterError),
 
     /// Structured command output could not be encoded.
     #[error("failed to encode structured command output: {source}")]

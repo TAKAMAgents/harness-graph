@@ -1,0 +1,27 @@
+[package]
+name = "harness-graph-neo4j-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+harness-graph-domain = { path = "../domain" }
+harness-graph-graph-port = { path = "../graph-port" }
+neo4rs.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+dotenvy.workspace = true
+harness-graph-ingestion = { path = "../ingestion" }
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
