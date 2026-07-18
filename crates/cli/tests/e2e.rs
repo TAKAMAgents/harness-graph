@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 const SESSION_ID: &str = "019c63db-2995-74c3-b898-c1b92a8e1317";
 const SECOND_SESSION_ID: &str = "019c63db-2995-74c3-b898-c1b92a8e1318";
+const METADATA_ONLY_SESSION_ID: &str = "019c63db-2995-74c3-b898-c1b92a8e1319";
 
 fn fixture_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -233,8 +234,14 @@ async fn bulk_import_settles_repairs_and_preserves_shared_source_provenance()
         .path()
         .join("active/2026-02-16")
         .join(SECOND_SESSION_ID);
+    let metadata_only_bundle = temporary
+        .path()
+        .join("active/2026-02-16")
+        .join(METADATA_ONLY_SESSION_ID);
     create_source_safe_bundle(&first_bundle, SESSION_ID)?;
     create_source_safe_bundle(&second_bundle, SECOND_SESSION_ID)?;
+    create_source_safe_bundle(&metadata_only_bundle, METADATA_ONLY_SESSION_ID)?;
+    reduce_to_metadata_only(&metadata_only_bundle)?;
     std::fs::OpenOptions::new()
         .append(true)
         .open(second_bundle.join("raw/rollout.jsonl"))?
@@ -275,8 +282,8 @@ async fn run_bulk_import_scenario(
         "tampered sweep did not settle with failures",
     )?;
     ensure(
-        first_summary["discovered_sessions"] == 2
-            && first_summary["imported_sessions"] == 1
+        first_summary["discovered_sessions"] == 3
+            && first_summary["imported_sessions"] == 2
             && first_summary["failed_sessions"] == 1,
         "tampered sweep session counts were incorrect",
     )?;
@@ -292,6 +299,19 @@ async fn run_bulk_import_scenario(
             }),
         "tampered session did not report an archive-integrity failure",
     )?;
+    ensure(
+        first_summary["sessions"]
+            .as_array()
+            .is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    session["session_id"] == METADATA_ONLY_SESSION_ID
+                        && session["status"] == "imported"
+                        && session["analysis"]["status"] == "insufficient_semantic_evidence"
+                        && session["analysis"]["semantic_activities"] == 0
+                })
+            }),
+        "metadata-only session did not preserve typed analysis unavailability",
+    )?;
 
     std::fs::copy(
         fixture_root()?
@@ -306,16 +326,16 @@ async fn run_bulk_import_scenario(
     let second_summary: serde_json::Value = serde_json::from_slice(&second.stdout)?;
     ensure(
         second_summary["status"] == "completed"
-            && second_summary["already_complete_sessions"] == 2
+            && second_summary["already_complete_sessions"] == 3
             && second_summary["imported_sessions"] == 0
             && second_summary["failed_sessions"] == 0,
-        "repaired sweep did not skip both completed source snapshots",
+        "repaired sweep did not skip all completed source snapshots",
     )?;
     let sessions = second_summary["sessions"]
         .as_array()
         .ok_or("repaired sweep omitted session settlements")?;
     ensure(
-        sessions.len() == 2
+        sessions.len() == 3
             && sessions
                 .iter()
                 .all(|session| session["status"] == "already_complete")
@@ -327,12 +347,16 @@ async fn run_bulk_import_scenario(
     ensure(
         counts
             == GraphCounts {
-                sessions: 2,
-                provenance_edges: 2,
-                sources: 1,
-                observations: 12,
+                sessions: 3,
+                provenance_edges: 3,
+                sources: 2,
+                observations: 13,
+                receipts: 2,
+                activities: 4,
+                outcomes: 1,
+                paths: 1,
             },
-        "Neo4j provenance counts did not preserve two sessions and one source",
+        "Neo4j counts did not preserve provenance or typed analysis absence",
     )
 }
 
@@ -378,10 +402,39 @@ fn create_source_safe_bundle(
     metadata["session_id"] = serde_json::Value::String(session_id.to_owned());
     let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
     std::fs::write(destination.join("metadata.json"), &metadata_bytes)?;
+    write_checksum_manifest(destination, &metadata_bytes)
+}
+
+fn reduce_to_metadata_only(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let raw_path = destination.join("raw/rollout.jsonl");
+    let raw = std::fs::read_to_string(&raw_path)?;
+    let first_record = raw.lines().next().ok_or("fixture raw stream is empty")?;
+    let raw_bytes = format!("{first_record}\n").into_bytes();
+    std::fs::write(&raw_path, &raw_bytes)?;
+
+    let metadata_path = destination.join("metadata.json");
+    let mut metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
+    let raw_digest = sha256_bytes(&raw_bytes);
+    let raw_size = u64::try_from(raw_bytes.len())?;
+    metadata["source_size_bytes"] = serde_json::Value::from(raw_size);
+    metadata["source_sha256"] = serde_json::Value::String(raw_digest.clone());
+    metadata["raw_size_bytes"] = serde_json::Value::from(raw_size);
+    metadata["raw_sha256"] = serde_json::Value::String(raw_digest);
+    metadata["record_count"] = serde_json::Value::from(1_u64);
+    metadata["parse_error_count"] = serde_json::Value::from(0_u64);
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+    std::fs::write(metadata_path, &metadata_bytes)?;
+    write_checksum_manifest(destination, &metadata_bytes)
+}
+
+fn write_checksum_manifest(
+    destination: &Path,
+    metadata_bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = format!(
         "{}  README.md\n{}  metadata.json\n{}  raw/rollout.jsonl\n",
         sha256_file(&destination.join("README.md"))?,
-        sha256_bytes(&metadata_bytes),
+        sha256_bytes(metadata_bytes),
         sha256_file(&destination.join("raw/rollout.jsonl"))?,
     );
     std::fs::write(destination.join("checksums.sha256"), manifest)?;
@@ -402,6 +455,10 @@ struct GraphCounts {
     provenance_edges: i64,
     sources: i64,
     observations: i64,
+    receipts: i64,
+    activities: i64,
+    outcomes: i64,
+    paths: i64,
 }
 
 async fn graph_counts(
@@ -418,8 +475,20 @@ async fn graph_counts(
                       count(DISTINCT edge) AS provenance_edges, \
                       count(DISTINCT source) AS sources \
                  MATCH (observation:HGObservation {hg_namespace: $namespace}) \
-                 RETURN sessions, provenance_edges, sources, \
-                        count(observation) AS observations",
+                 WITH sessions, provenance_edges, sources, \
+                      count(observation) AS observations \
+                 OPTIONAL MATCH (receipt:HGIngestionReceipt {hg_namespace: $namespace}) \
+                 WITH sessions, provenance_edges, sources, observations, \
+                      count(DISTINCT receipt) AS receipts \
+                 OPTIONAL MATCH (activity:HGActivity {hg_namespace: $namespace}) \
+                 WITH sessions, provenance_edges, sources, observations, receipts, \
+                      count(DISTINCT activity) AS activities \
+                 OPTIONAL MATCH (outcome:HGOutcome {hg_namespace: $namespace}) \
+                 WITH sessions, provenance_edges, sources, observations, receipts, activities, \
+                      count(DISTINCT outcome) AS outcomes \
+                 OPTIONAL MATCH (path:HGPathPattern {hg_namespace: $namespace}) \
+                 RETURN sessions, provenance_edges, sources, observations, receipts, activities, \
+                        outcomes, count(DISTINCT path) AS paths",
             )
             .param("namespace", namespace),
         )
@@ -433,6 +502,10 @@ async fn graph_counts(
         provenance_edges: row.get("provenance_edges")?,
         sources: row.get("sources")?,
         observations: row.get("observations")?,
+        receipts: row.get("receipts")?,
+        activities: row.get("activities")?,
+        outcomes: row.get("outcomes")?,
+        paths: row.get("paths")?,
     })
 }
 

@@ -91,6 +91,12 @@ digest and sequence, and a trustworthy receipt avoids replaying an already
 complete snapshot. `HARNESS_GRAPH_NAMESPACE` isolates graph populations and
 `HARNESS_GRAPH_BATCH_SIZE` controls the validated transaction bound.
 
+Metadata-only sessions are valid raw snapshots but cannot support an outcome or
+execution path. They are imported and receipted without synthetic semantic
+nodes, and their import result reports
+`analysis.status = "insufficient_semantic_evidence"`. Actual correlation,
+classification, assurance, path, and projection errors still fail that session.
+
 The current projection stores source/session provenance, observations,
 quarantined variants, content-addressed contexts, turns, native-ID-correlated
 tool calls, tools, compressed semantic activities, evidence-derived outcomes,

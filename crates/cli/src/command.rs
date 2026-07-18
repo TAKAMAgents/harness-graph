@@ -8,7 +8,8 @@ use harness_graph_assurance::assess_outcome;
 use harness_graph_classification::ActivityBuilder;
 use harness_graph_correlation::CorrelationEngine;
 use harness_graph_domain::{
-    AnalysisReport, DecodedNativeRecord, RecordCount, SessionId, ToolCallLifecycle,
+    AnalysisReport, DecodedNativeRecord, RecordCount, SemanticActivities, SessionId,
+    ToolCallCorrelations, ToolCallLifecycle,
 };
 use harness_graph_event_journal::AppendOnlyJournal;
 use harness_graph_graph_port::{
@@ -337,7 +338,7 @@ struct ImportOutput {
     quarantined_records: u64,
     total_records: u64,
     observations_in_namespace: u64,
-    analysis: AnalysisOutput,
+    analysis: ImportAnalysisOutput,
 }
 
 #[derive(Serialize)]
@@ -395,7 +396,7 @@ enum BulkSessionOutput {
         known_records: u64,
         quarantined_records: u64,
         total_records: u64,
-        analysis: AnalysisOutput,
+        analysis: ImportAnalysisOutput,
     },
     AlreadyComplete {
         session_id: String,
@@ -457,6 +458,18 @@ struct AnalysisOutput {
 }
 
 #[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ImportAnalysisOutput {
+    Projected {
+        #[serde(flatten)]
+        analysis: AnalysisOutput,
+    },
+    InsufficientSemanticEvidence {
+        semantic_activities: RecordCount,
+    },
+}
+
+#[derive(Serialize)]
 struct AnalyzeOutput {
     status: &'static str,
     session_id: String,
@@ -477,6 +490,17 @@ struct AnalysisAccumulator {
     risks: RiskEngine,
 }
 
+struct AnalysisComponents {
+    correlations: ToolCallCorrelations,
+    activities: SemanticActivities,
+    risks: RiskEngine,
+}
+
+enum ImportAnalysis {
+    Projected(AnalysisReport),
+    InsufficientSemanticEvidence,
+}
+
 impl AnalysisAccumulator {
     fn observe(&mut self, record: &DecodedNativeRecord) -> Result<(), CliError> {
         self.risks.observe(record);
@@ -487,20 +511,44 @@ impl AnalysisAccumulator {
         Ok(())
     }
 
-    fn finish(self) -> Result<AnalysisReport, CliError> {
+    fn into_components(self) -> Result<AnalysisComponents, CliError> {
         let correlations = self.correlations.finish()?;
         let activities = self.activities.finish(&correlations)?;
-        let outcome = assess_outcome(&activities)?;
-        let risks = self.risks.finish(&activities, &correlations, &outcome)?;
-        let path = derive_path(&activities)?;
-        Ok(AnalysisReport::new(
+        Ok(AnalysisComponents {
             correlations,
             activities,
-            outcome,
-            risks,
-            path,
-        ))
+            risks: self.risks,
+        })
     }
+
+    fn finish(self) -> Result<AnalysisReport, CliError> {
+        finalize_analysis(self.into_components()?)
+    }
+
+    fn finish_for_import(self) -> Result<ImportAnalysis, CliError> {
+        let components = self.into_components()?;
+        if components.activities.count().value() == 0 {
+            Ok(ImportAnalysis::InsufficientSemanticEvidence)
+        } else {
+            Ok(ImportAnalysis::Projected(finalize_analysis(components)?))
+        }
+    }
+}
+
+fn finalize_analysis(components: AnalysisComponents) -> Result<AnalysisReport, CliError> {
+    let outcome = assess_outcome(&components.activities)?;
+    let risks =
+        components
+            .risks
+            .finish(&components.activities, &components.correlations, &outcome)?;
+    let path = derive_path(&components.activities)?;
+    Ok(AnalysisReport::new(
+        components.correlations,
+        components.activities,
+        outcome,
+        risks,
+        path,
+    ))
 }
 
 fn analyze(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
@@ -800,7 +848,7 @@ struct SessionImportReceipt {
     known_records: RecordCount,
     quarantined_records: RecordCount,
     total_records: RecordCount,
-    analysis: AnalysisOutput,
+    analysis: ImportAnalysisOutput,
 }
 
 async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
@@ -1033,13 +1081,27 @@ async fn import_verified_session(
     }
     validate_record_count(expected_records, total_records)?;
 
-    let report = analysis.finish()?;
-    let analysis_output = summarize_analysis(&report);
-    adapter
-        .project(GraphBatch::first(GraphCommand::UpsertAnalysis(
-            AnalysisProjectionCommand::new(namespace.clone(), session_id, source_digest, report),
-        )))
-        .await?;
+    let analysis_output = match analysis.finish_for_import()? {
+        ImportAnalysis::Projected(report) => {
+            let output = summarize_analysis(&report);
+            adapter
+                .project(GraphBatch::first(GraphCommand::UpsertAnalysis(
+                    AnalysisProjectionCommand::new(
+                        namespace.clone(),
+                        session_id,
+                        source_digest,
+                        report,
+                    ),
+                )))
+                .await?;
+            ImportAnalysisOutput::Projected { analysis: output }
+        }
+        ImportAnalysis::InsufficientSemanticEvidence => {
+            ImportAnalysisOutput::InsufficientSemanticEvidence {
+                semantic_activities: RecordCount::default(),
+            }
+        }
+    };
 
     adapter
         .project(GraphBatch::first(GraphCommand::FinalizeIngestion(

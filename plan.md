@@ -1525,6 +1525,9 @@ same command is therefore safe to resume without treating partial work as
 success. A full-process real-Neo4j regression proves nonzero all-results-settle
 behavior, repair and rerun, and two distinct sessions retaining separate
 `IMPORTED_FROM` provenance while sharing one content-addressed source snapshot.
+The same regression includes a one-record metadata-only source: raw ingestion
+completes with a typed `insufficient_semantic_evidence` analysis result while
+Neo4j receives no fabricated activity, outcome, or path nodes.
 
 Live bulk evidence (2026-07-18): an initial four-way archived sweep exposed two
 real composition failures. Older Codex archives report one command result
