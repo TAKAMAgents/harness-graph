@@ -1543,6 +1543,18 @@ with zero failures: 79 pending sources completed and 355 exact completed
 snapshots were skipped. The configured namespace then contained 125,531 typed
 observations.
 
+Full archive completion evidence (2026-07-18): the first active sweep settled
+all 935 sessions and exposed four valid metadata-only snapshots at the
+assurance boundary. They had one known record each but no activity evidence,
+so the importer now records typed semantic unavailability and completes raw
+ingestion without inventing outcomes or paths. The resumable rerun imported
+those four snapshots, skipped 931 exact receipts, and finished with zero
+failures. A final deduplicated all-scope proof discovered 1,369 sessions,
+reported all 1,369 already complete, imported zero, and failed zero. The
+configured Neo4j namespace contains 2,410,017 observations, matching the
+verified active-plus-archived record inventory. The release live API was then
+started on an available loopback port and returned a ready health response.
+
 ## Phase 3: deterministic semantic compression
 
 Deliver:
