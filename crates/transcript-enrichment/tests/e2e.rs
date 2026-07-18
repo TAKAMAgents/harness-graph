@@ -60,6 +60,15 @@ fn verified_rich_transcript_is_redacted_bounded_and_deterministic_end_to_end()
         return Err("rich verified transcript was not prepared".into());
     };
 
+    assert_eq!(
+        first.disclosure_scope(),
+        TranscriptDisclosureScope::ConversationAndExecution
+    );
+    assert_eq!(
+        first.authorization_policy_digest(),
+        AuthorizationPolicyDigest::hash(b"reviewed test policy")
+    );
+    assert_eq!(first.chunking_policy_version().as_str(), "chunk-e2e-v1");
     assert_rich_inventory(first, records.len())?;
     let debug_rendering = format!("{first:?}");
     assert_sensitive_values_are_absent(first, &debug_rendering);

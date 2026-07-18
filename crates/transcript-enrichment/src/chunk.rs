@@ -16,9 +16,9 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ChunkingPolicyVersion, DisclosureAuthorization, LocalTranscriptRedactor,
-    LocallySanitizedFragment, RedactionCounts, RedactionOutcome, RedactionReceipt,
-    SanitizedContentDigest, TranscriptEnrichmentError,
+    AuthorizationPolicyDigest, ChunkingPolicyVersion, DisclosureAuthorization,
+    LocalTranscriptRedactor, LocallySanitizedFragment, RedactionCounts, RedactionOutcome,
+    RedactionReceipt, SanitizedContentDigest, TranscriptDisclosureScope, TranscriptEnrichmentError,
 };
 
 const MIN_CHUNK_BYTES: usize = 256;
@@ -624,6 +624,9 @@ impl TranscriptInventory {
 #[derive(Debug, Clone)]
 pub struct PreparedTranscript {
     projection_digest: TranscriptProjectionDigest,
+    disclosure_scope: TranscriptDisclosureScope,
+    authorization_policy_digest: AuthorizationPolicyDigest,
+    chunking_policy_version: ChunkingPolicyVersion,
     chunks: BoundedTranscriptChunks,
     receipts: Vec<RedactionReceipt>,
     inventory: TranscriptInventory,
@@ -634,6 +637,24 @@ impl PreparedTranscript {
     #[must_use]
     pub const fn projection_digest(&self) -> TranscriptProjectionDigest {
         self.projection_digest
+    }
+
+    /// Exact disclosure scope used by the local preparation pipeline.
+    #[must_use]
+    pub const fn disclosure_scope(&self) -> TranscriptDisclosureScope {
+        self.disclosure_scope
+    }
+
+    /// Digest of the disclosure policy used to authorize preparation.
+    #[must_use]
+    pub const fn authorization_policy_digest(&self) -> AuthorizationPolicyDigest {
+        self.authorization_policy_digest
+    }
+
+    /// Chunking policy version included in every prepared chunk identity.
+    #[must_use]
+    pub const fn chunking_policy_version(&self) -> &ChunkingPolicyVersion {
+        &self.chunking_policy_version
     }
 
     /// Sanitized bounded chunks.
@@ -716,6 +737,8 @@ struct PreparationAccumulator {
     receipts: Vec<RedactionReceipt>,
     block_reason: Option<TranscriptPreparationBlockReason>,
     projection_hasher: Sha256,
+    disclosure_scope: TranscriptDisclosureScope,
+    authorization_policy_digest: AuthorizationPolicyDigest,
 }
 
 impl PreparationAccumulator {
@@ -737,6 +760,8 @@ impl PreparationAccumulator {
             receipts: Vec::new(),
             block_reason: None,
             projection_hasher,
+            disclosure_scope: authorization.scope(),
+            authorization_policy_digest: authorization.policy_digest(),
         }
     }
 
@@ -843,6 +868,9 @@ impl PreparationAccumulator {
         }
         Ok(TranscriptPreparation::Prepared(PreparedTranscript {
             projection_digest: TranscriptProjectionDigest::from_hasher(self.projection_hasher),
+            disclosure_scope: self.disclosure_scope,
+            authorization_policy_digest: self.authorization_policy_digest,
+            chunking_policy_version: policy.version().clone(),
             chunks,
             receipts: self.receipts,
             inventory,
