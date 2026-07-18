@@ -5,6 +5,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use harness_graph_domain::GraphNamespace;
 use harness_graph_graph_port::BatchSize;
 use harness_graph_ingestion::ArchiveRoot;
+use harness_graph_mistral_adapter::{MistralCredential, MistralModelName};
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
@@ -16,7 +17,7 @@ pub struct AppConfig {
     neo4j: Neo4jConnection,
     graph_namespace: GraphNamespace,
     graph_batch_size: BatchSize,
-    mistral_api_key: MistralApiKey,
+    mistral_credential: MistralCredential,
     mistral_model: MistralModelName,
     bind_address: SocketAddr,
 }
@@ -70,8 +71,8 @@ impl AppConfig {
             neo4j: Neo4jConnection::new(&neo4j_url, &neo4j_username, neo4j_password)?,
             graph_namespace,
             graph_batch_size,
-            mistral_api_key: MistralApiKey::new(mistral_api_key)?,
-            mistral_model: MistralModelName::new(&mistral_model)?,
+            mistral_credential: MistralCredential::new(mistral_api_key)?,
+            mistral_model: MistralModelName::new(mistral_model)?,
             bind_address,
         })
     }
@@ -102,8 +103,8 @@ impl AppConfig {
 
     /// Mistral API key.
     #[must_use]
-    pub const fn mistral_api_key(&self) -> &MistralApiKey {
-        &self.mistral_api_key
+    pub const fn mistral_credential(&self) -> &MistralCredential {
+        &self.mistral_credential
     }
 
     /// Mistral model selection.
@@ -127,7 +128,7 @@ impl std::fmt::Debug for AppConfig {
             .field("neo4j", &self.neo4j)
             .field("graph_namespace", &self.graph_namespace)
             .field("graph_batch_size", &self.graph_batch_size)
-            .field("mistral_api_key", &"[redacted]")
+            .field("mistral_credential", &"[redacted]")
             .field("mistral_model", &self.mistral_model)
             .field("bind_address", &self.bind_address)
             .finish()
@@ -222,56 +223,6 @@ impl std::fmt::Debug for Neo4jConnection {
             .field("username", &self.username)
             .field("password", &"[redacted]")
             .finish()
-    }
-}
-
-/// Secret Mistral API key with redacted debug output.
-pub struct MistralApiKey(SecretString);
-
-impl MistralApiKey {
-    fn new(value: String) -> Result<Self, CliError> {
-        if value.trim().is_empty() {
-            return Err(CliError::InvalidConfiguration {
-                canonical_name: "MISTRAL_API_KEY",
-                reason: "API key cannot be empty",
-            });
-        }
-        Ok(Self(SecretString::from(value)))
-    }
-
-    /// Expose the API key only to the concrete Mistral adapter.
-    #[must_use]
-    pub fn expose_secret(&self) -> &str {
-        self.0.expose_secret()
-    }
-}
-
-impl std::fmt::Debug for MistralApiKey {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("MistralApiKey([redacted])")
-    }
-}
-
-/// Validated Mistral model name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MistralModelName(String);
-
-impl MistralModelName {
-    fn new(value: &str) -> Result<Self, CliError> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err(CliError::InvalidConfiguration {
-                canonical_name: "MISTRAL_MODEL",
-                reason: "model name cannot be empty",
-            });
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    /// Borrow the provider model name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 

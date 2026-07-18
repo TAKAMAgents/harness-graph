@@ -10,8 +10,10 @@ rust-version.workspace = true
 async-trait.workspace = true
 harness-graph-domain = { path = "../domain" }
 harness-graph-graph-port = { path = "../graph-port" }
+harness-graph-planning = { path = "../planning" }
 neo4rs.workspace = true
 secrecy.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true

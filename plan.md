@@ -948,6 +948,20 @@ pub struct RigMistralClassifier {
 
 No Rig or Mistral types leave the adapter crate.
 
+The implemented narrative boundary keeps evidence coverage deterministic:
+
+```text
+typed deterministic activities
+→ Rust-owned contiguous citation groups
+→ Mistral structured labels
+→ citation-complete NarrativeSummary
+```
+
+Missing model group labels do not remove evidence. They become explicit
+`deterministic_fallback` kind-only labels, while every Mistral-supplied label is
+marked `mistral`. The provider is fixed by the Rig Mistral client and the model
+name is validated as a Mistral-hosted family before construction.
+
 ---
 
 # 14. Outcome engine
@@ -1513,6 +1527,11 @@ Inspect
 → CompleteWithConcern
 ```
 
+Implemented evidence (2026-07-18): the real 621-record snapshot deterministically
+produces 56 episodes, then 19 narrative macro-activities covering all 56 unique
+activity IDs exactly once. Model omissions are retained as provenance-marked
+deterministic fallbacks rather than hidden or fabricated labels.
+
 ## Phase 4: risk and assurance
 
 Deliver:
@@ -1583,6 +1602,12 @@ Exit criterion:
 ```text
 new task retrieves and cites a successful precedent
 ```
+
+Implemented evidence (2026-07-18): the typed `PrecedentReader` selects only
+`verified_success` plus `fresh` paths from Neo4j. The real Pathfinder E2E
+retrieved session `019c8b3b-2aa8-7183-ba61-379f5b0af31c`, generated five ordered
+steps through Rig/Mistral, and validated every session and activity citation
+against that retrieved precedent before returning the candidate plan.
 
 ## Phase 8: live OpenCode capture
 
@@ -1743,8 +1768,8 @@ OpenCode begins working and the graph grows live.
 [x] Outcomes are determined from evidence.
 [x] Risks link to concrete supporting observations.
 [ ] Paths store time, cost, correctness, and uncertainty.
-[ ] Pathfinder uses typed tools rather than raw Cypher.
-[ ] Candidate plans cite supporting runs.
+[x] Pathfinder uses typed tools rather than raw Cypher.
+[x] Candidate plans cite supporting runs.
 [ ] OpenCode can append events in real time.
 [x] Raw transcripts, instruction bodies, assets, and absolute paths are never committed.
 [x] Remote asset references are never fetched automatically.

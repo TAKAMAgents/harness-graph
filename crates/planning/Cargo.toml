@@ -1,0 +1,16 @@
+[package]
+name = "harness-graph-planning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+harness-graph-domain = { path = "../domain" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

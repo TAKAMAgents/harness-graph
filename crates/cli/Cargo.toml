@@ -19,8 +19,10 @@ harness-graph-correlation = { path = "../correlation" }
 harness-graph-domain = { path = "../domain" }
 harness-graph-graph-port = { path = "../graph-port" }
 harness-graph-ingestion = { path = "../ingestion" }
+harness-graph-mistral-adapter = { path = "../mistral-adapter" }
 harness-graph-neo4j-adapter = { path = "../neo4j-adapter" }
 harness-graph-path-analysis = { path = "../path-analysis" }
+harness-graph-planning = { path = "../planning" }
 harness-graph-risk = { path = "../risk" }
 secrecy.workspace = true
 serde.workspace = true

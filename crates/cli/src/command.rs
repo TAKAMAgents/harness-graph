@@ -14,8 +14,13 @@ use harness_graph_graph_port::{
 use harness_graph_ingestion::{
     DecodedRecordStream, IngestionError, SessionScope, SourceKind, inspect_bundle,
 };
+use harness_graph_mistral_adapter::RigMistralAdapter;
 use harness_graph_neo4j_adapter::Neo4jAdapter;
 use harness_graph_path_analysis::derive_path;
+use harness_graph_planning::{
+    ModelUsage, NarrativeInterpreter, NarrativeOrigin, NarrativeRequest, Pathfinder,
+    PlanningContext, PrecedentLimit, PrecedentReader, TaskBrief,
+};
 use harness_graph_risk::RiskEngine;
 use secrecy::SecretString;
 use serde::Serialize;
@@ -39,6 +44,9 @@ pub async fn run() -> Result<(), CliError> {
         Command::Verify { session_id } => verify(&config, &session_id),
         Command::Inspect { session_id } => inspect(&config, &session_id),
         Command::Analyze { session_id } => analyze(&config, &session_id),
+        Command::MistralHealth => mistral_health(&config).await,
+        Command::Summarize { session_id } => summarize(&config, &session_id).await,
+        Command::Pathfinder { task, precedents } => pathfinder(&config, task, precedents).await,
         Command::Import { session_id } => import(&config, &session_id).await,
     }
 }
@@ -85,6 +93,23 @@ enum Command {
         #[arg(long)]
         session_id: String,
     },
+    /// Verify the configured Rig-backed Mistral provider against its real API.
+    MistralHealth,
+    /// Ask Mistral to macro-summarize deterministic activities with citations.
+    Summarize {
+        /// Stable session UUID.
+        #[arg(long)]
+        session_id: String,
+    },
+    /// Retrieve verified Neo4j precedents and ask Mistral for a cited plan.
+    Pathfinder {
+        /// Source-safe task brief. Do not include secrets or raw payloads.
+        #[arg(long)]
+        task: String,
+        /// Maximum verified precedents to retrieve.
+        #[arg(long, default_value_t = 3)]
+        precedents: usize,
+    },
     /// Verify, stream, and atomically upsert one session into Neo4j.
     Import {
         /// Stable session UUID.
@@ -128,7 +153,7 @@ struct CredentialStatus {
 fn doctor(config: &AppConfig) -> Result<(), CliError> {
     let _archive = config.archive_root();
     let _neo4j = config.neo4j();
-    let _mistral_key = config.mistral_api_key();
+    let _mistral_credential = config.mistral_credential();
     write_json(&DoctorOutput {
         status: "ready",
         archive: "configured",
@@ -251,6 +276,12 @@ struct AnalyzeOutput {
     analysis: AnalysisOutput,
 }
 
+struct SessionAnalysis {
+    session_id: SessionId,
+    source_digest: harness_graph_domain::SourceDigest,
+    report: AnalysisReport,
+}
+
 #[derive(Debug, Default)]
 struct AnalysisAccumulator {
     correlations: CorrelationEngine,
@@ -285,6 +316,16 @@ impl AnalysisAccumulator {
 }
 
 fn analyze(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
+    let analyzed = analyze_session(config, session_id)?;
+    write_json(&AnalyzeOutput {
+        status: "analyzed",
+        session_id: analyzed.session_id.to_string(),
+        source_digest: analyzed.source_digest.to_hex(),
+        analysis: summarize_analysis(&analyzed.report),
+    })
+}
+
+fn analyze_session(config: &AppConfig, session_id: &str) -> Result<SessionAnalysis, CliError> {
     let session_id = SessionId::parse(session_id)?;
     let catalog = config.archive_root().discover(SessionScope::All)?;
     let verified = catalog.require(session_id)?.verify()?;
@@ -299,12 +340,180 @@ fn analyze(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     }
     validate_record_count(expected_records, total_records)?;
     let report = accumulator.finish()?;
-    write_json(&AnalyzeOutput {
-        status: "analyzed",
-        session_id: session_id.to_string(),
-        source_digest: source_digest.to_hex(),
-        analysis: summarize_analysis(&report),
+    Ok(SessionAnalysis {
+        session_id,
+        source_digest,
+        report,
     })
+}
+
+#[derive(Serialize)]
+struct MistralHealthOutput {
+    status: &'static str,
+    provider: &'static str,
+    model: String,
+}
+
+async fn mistral_health(config: &AppConfig) -> Result<(), CliError> {
+    let adapter = mistral_adapter(config)?;
+    adapter.health().await?;
+    write_json(&MistralHealthOutput {
+        status: "ready",
+        provider: "mistral",
+        model: adapter.model().as_str().to_owned(),
+    })
+}
+
+#[derive(Serialize)]
+struct ModelUsageOutput {
+    #[serde(rename = "input_tokens")]
+    input: u64,
+    #[serde(rename = "output_tokens")]
+    output: u64,
+    #[serde(rename = "total_tokens")]
+    total: u64,
+}
+
+impl From<ModelUsage> for ModelUsageOutput {
+    fn from(value: ModelUsage) -> Self {
+        Self {
+            input: value.input().value(),
+            output: value.output().value(),
+            total: value.total().value(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NarrativeActivityOutput {
+    title: String,
+    kind: &'static str,
+    origin: &'static str,
+    cited_activity_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SummarizeOutput {
+    status: &'static str,
+    provider: &'static str,
+    model: String,
+    session_id: String,
+    deterministic_activities: u64,
+    narrative_activity_count: u64,
+    mistral_labeled: u64,
+    deterministic_fallbacks: u64,
+    narrative_activities: Vec<NarrativeActivityOutput>,
+    usage: ModelUsageOutput,
+}
+
+async fn summarize(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
+    let analyzed = analyze_session(config, session_id)?;
+    let deterministic_activities = analyzed.report.activities().count().value();
+    let adapter = mistral_adapter(config)?;
+    let result = adapter
+        .summarize(NarrativeRequest::new(analyzed.report.activities().clone()))
+        .await?;
+    let narrative_activity_count = result.value().count().value();
+    let mut mistral_labeled = RecordCount::default();
+    let mut deterministic_fallbacks = RecordCount::default();
+    for activity in result.value().iter() {
+        match activity.origin() {
+            NarrativeOrigin::Mistral => mistral_labeled.increment(),
+            NarrativeOrigin::DeterministicFallback => deterministic_fallbacks.increment(),
+        }
+    }
+    let narrative_activities = result
+        .value()
+        .iter()
+        .map(|activity| NarrativeActivityOutput {
+            title: activity.title().as_str().to_owned(),
+            kind: activity.kind().as_str(),
+            origin: activity.origin().as_str(),
+            cited_activity_ids: activity
+                .citations()
+                .iter()
+                .map(|citation| citation.to_hex())
+                .collect(),
+        })
+        .collect();
+    write_json(&SummarizeOutput {
+        status: "summarized",
+        provider: "mistral",
+        model: adapter.model().as_str().to_owned(),
+        session_id: analyzed.session_id.to_string(),
+        deterministic_activities,
+        narrative_activity_count,
+        mistral_labeled: mistral_labeled.value(),
+        deterministic_fallbacks: deterministic_fallbacks.value(),
+        narrative_activities,
+        usage: result.usage().into(),
+    })
+}
+
+#[derive(Serialize)]
+struct PlannedStepOutput {
+    kind: &'static str,
+    rationale: String,
+    cited_activity_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PathfinderOutput {
+    status: &'static str,
+    provider: &'static str,
+    model: String,
+    retrieved_precedents: u64,
+    cited_session_ids: Vec<String>,
+    steps: Vec<PlannedStepOutput>,
+    usage: ModelUsageOutput,
+}
+
+async fn pathfinder(config: &AppConfig, task: String, precedents: usize) -> Result<(), CliError> {
+    let context = PlanningContext::new(TaskBrief::new(task)?);
+    let adapter = connect_neo4j(config).await?;
+    adapter.health().await?;
+    let precedents = adapter
+        .verified_precedents(config.graph_namespace(), PrecedentLimit::new(precedents)?)
+        .await?;
+    let retrieved_precedents = precedents.count().value();
+    let mistral = mistral_adapter(config)?;
+    let result = mistral.propose(context, precedents).await?;
+    let cited_session_ids = result
+        .value()
+        .precedents()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let steps = result
+        .value()
+        .steps()
+        .iter()
+        .map(|step| PlannedStepOutput {
+            kind: step.kind().as_str(),
+            rationale: step.rationale().as_str().to_owned(),
+            cited_activity_ids: step
+                .citations()
+                .iter()
+                .map(|citation| citation.to_hex())
+                .collect(),
+        })
+        .collect();
+    write_json(&PathfinderOutput {
+        status: "planned",
+        provider: "mistral",
+        model: mistral.model().as_str().to_owned(),
+        retrieved_precedents,
+        cited_session_ids,
+        steps,
+        usage: result.usage().into(),
+    })
+}
+
+fn mistral_adapter(config: &AppConfig) -> Result<RigMistralAdapter, CliError> {
+    Ok(RigMistralAdapter::new(
+        config.mistral_credential(),
+        config.mistral_model().clone(),
+    )?)
 }
 
 enum PendingBatch {
@@ -320,13 +529,7 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     let expected_records = verified.expected_records();
     let namespace = config.graph_namespace().clone();
 
-    let neo4j = config.neo4j();
-    let adapter = Neo4jAdapter::connect(
-        &neo4j.bolt_address()?,
-        neo4j.username(),
-        SecretString::from(neo4j.expose_password().to_owned()),
-    )
-    .await?;
+    let adapter = connect_neo4j(config).await?;
     adapter.health().await?;
     adapter.ensure_schema().await?;
     adapter
@@ -401,6 +604,16 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
         observations_in_namespace: observations_in_namespace.value(),
         analysis: analysis_output,
     })
+}
+
+async fn connect_neo4j(config: &AppConfig) -> Result<Neo4jAdapter, CliError> {
+    let neo4j = config.neo4j();
+    Ok(Neo4jAdapter::connect(
+        &neo4j.bolt_address()?,
+        neo4j.username(),
+        SecretString::from(neo4j.expose_password().to_owned()),
+    )
+    .await?)
 }
 
 fn validate_record_count(expected: RecordCount, actual: RecordCount) -> Result<(), CliError> {

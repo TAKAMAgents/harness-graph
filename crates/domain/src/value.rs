@@ -128,6 +128,25 @@ impl RecordCount {
     }
 }
 
+/// Number of foundation-model tokens reported by a provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenCount(u64);
+
+impl TokenCount {
+    /// Construct a provider-reported token count.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the numeric token count.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// Timestamp at which a native observation occurred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

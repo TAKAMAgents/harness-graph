@@ -6,8 +6,10 @@ use harness_graph_correlation::CorrelationError;
 use harness_graph_domain::DomainError;
 use harness_graph_graph_port::GraphPortError;
 use harness_graph_ingestion::IngestionError;
+use harness_graph_mistral_adapter::MistralAdapterError;
 use harness_graph_neo4j_adapter::Neo4jAdapterError;
 use harness_graph_path_analysis::PathAnalysisError;
+use harness_graph_planning::PlanningError;
 use harness_graph_risk::RiskError;
 
 /// Top-level command failure.
@@ -60,6 +62,14 @@ pub enum CliError {
     /// Normalized execution-path derivation failed.
     #[error(transparent)]
     PathAnalysis(#[from] PathAnalysisError),
+
+    /// Mistral provider construction or invocation failed.
+    #[error(transparent)]
+    Mistral(#[from] MistralAdapterError),
+
+    /// Typed planning input was invalid.
+    #[error(transparent)]
+    Planning(#[from] PlanningError),
 
     /// Graph projection configuration failed validation.
     #[error(transparent)]

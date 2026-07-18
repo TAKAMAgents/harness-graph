@@ -10,6 +10,10 @@ use harness_graph_graph_port::{
     AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector,
     ProjectionReceipt, SourceSnapshotCommand,
 };
+use harness_graph_planning::{
+    PlanningError, PrecedentLimit, PrecedentPath, PrecedentPaths, PrecedentReader, PrecedentStep,
+    PrecedentSteps,
+};
 use neo4rs::{Graph, Query, query};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -55,6 +59,21 @@ pub enum Neo4jAdapterError {
         /// Static property name.
         field: &'static str,
     },
+
+    /// A graph property did not map back into the typed semantic vocabulary.
+    #[error("Neo4j semantic property {field} contained an unsupported value")]
+    InvalidSemanticProperty {
+        /// Property name only; the untrusted value is not echoed.
+        field: &'static str,
+    },
+
+    /// Retrieved precedent data violated a planning invariant.
+    #[error(transparent)]
+    Planning(#[from] PlanningError),
+
+    /// Retrieved graph identity failed domain validation.
+    #[error(transparent)]
+    Domain(#[from] harness_graph_domain::DomainError),
 }
 
 /// Concrete idempotent Neo4j graph adapter.
@@ -309,6 +328,136 @@ impl GraphProjector for Neo4jAdapter {
                 field: "batch command count",
             })?;
         Ok(ProjectionReceipt::new(RecordCount::new(committed)))
+    }
+}
+
+#[async_trait]
+impl PrecedentReader for Neo4jAdapter {
+    type Error = Neo4jAdapterError;
+
+    async fn verified_precedents(
+        &self,
+        namespace: &GraphNamespace,
+        limit: PrecedentLimit,
+    ) -> Result<PrecedentPaths, Self::Error> {
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (session:HGSession {hg_namespace: $namespace})-[:IMPORTED_FROM]->(src) \
+                     MATCH (src)-[:HAS_OUTCOME]->(outcome:HGOutcome) \
+                     WHERE outcome.class = 'verified_success' AND outcome.verification = 'fresh' \
+                     MATCH (src)-[:FOLLOWED_PATH]->(path:HGPathPattern) \
+                     MATCH (src)-[:HAS_ACTIVITY]->(activity:HGActivity) \
+                     WITH session, src, path, activity ORDER BY activity.first_sequence \
+                     WITH session, src, path, \
+                          collect(activity.activity_id) AS activity_ids, \
+                          collect(activity.kind) AS activity_kinds, \
+                          collect(activity.status) AS activity_statuses \
+                     RETURN session.session_id AS session_id, \
+                            src.source_digest AS source_digest, path.signature AS path_signature, \
+                            activity_ids, activity_kinds, activity_statuses \
+                     ORDER BY size(activity_ids) ASC LIMIT $limit",
+                )
+                .param("namespace", namespace.as_str())
+                .param("limit", to_i64(limit.value(), "verified precedent limit")?),
+            )
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "query verified precedents",
+                source,
+            })?;
+        let mut precedents = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "read verified precedents",
+                source,
+            })?
+        {
+            precedents.push(precedent_from_row(&row)?);
+        }
+        Ok(PrecedentPaths::new(precedents)?)
+    }
+}
+
+fn precedent_from_row(row: &neo4rs::Row) -> Result<PrecedentPath, Neo4jAdapterError> {
+    let session_id: String = read_property(row, "session_id")?;
+    let source_digest: String = read_property(row, "source_digest")?;
+    let path_signature: String = read_property(row, "path_signature")?;
+    let activity_ids: Vec<String> = read_property(row, "activity_ids")?;
+    let activity_kinds: Vec<String> = read_property(row, "activity_kinds")?;
+    let activity_statuses: Vec<String> = read_property(row, "activity_statuses")?;
+    if activity_ids.len() != activity_kinds.len() || activity_ids.len() != activity_statuses.len() {
+        return Err(Neo4jAdapterError::InvalidReadResult {
+            field: "precedent activity arrays",
+        });
+    }
+    let steps = activity_ids
+        .into_iter()
+        .zip(activity_kinds)
+        .zip(activity_statuses)
+        .map(|((id, kind), status)| {
+            Ok(PrecedentStep::new(
+                harness_graph_domain::ActivityId::parse_hex(&id)?,
+                parse_activity_kind(&kind)?,
+                parse_activity_status(&status)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Neo4jAdapterError>>()?;
+    Ok(PrecedentPath::new(
+        SessionId::parse(&session_id)?,
+        SourceDigest::parse_hex(&source_digest)?,
+        harness_graph_domain::PathSignature::parse_hex(&path_signature)?,
+        PrecedentSteps::new(steps)?,
+    ))
+}
+
+fn read_property<T>(row: &neo4rs::Row, field: &'static str) -> Result<T, Neo4jAdapterError>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    row.get(field)
+        .map_err(|_| Neo4jAdapterError::InvalidReadResult { field })
+}
+
+fn parse_activity_kind(
+    value: &str,
+) -> Result<harness_graph_domain::ActivityKind, Neo4jAdapterError> {
+    use harness_graph_domain::ActivityKind;
+    match value {
+        "start" => Ok(ActivityKind::Start),
+        "request" => Ok(ActivityKind::Request),
+        "inspect" => Ok(ActivityKind::Inspect),
+        "search" => Ok(ActivityKind::Search),
+        "modify" => Ok(ActivityKind::Modify),
+        "repair" => Ok(ActivityKind::Repair),
+        "verify" => Ok(ActivityKind::Verify),
+        "install" => Ok(ActivityKind::Install),
+        "execute" => Ok(ActivityKind::Execute),
+        "diagnose" => Ok(ActivityKind::Diagnose),
+        "request_permission" => Ok(ActivityKind::RequestPermission),
+        "network_access" => Ok(ActivityKind::NetworkAccess),
+        "destructive" => Ok(ActivityKind::Destructive),
+        "manage_context" => Ok(ActivityKind::ManageContext),
+        "rollback" => Ok(ActivityKind::Rollback),
+        "complete" => Ok(ActivityKind::Complete),
+        _ => Err(Neo4jAdapterError::InvalidSemanticProperty { field: "kind" }),
+    }
+}
+
+fn parse_activity_status(
+    value: &str,
+) -> Result<harness_graph_domain::ActivityStatus, Neo4jAdapterError> {
+    use harness_graph_domain::ActivityStatus;
+    match value {
+        "pending" => Ok(ActivityStatus::Pending),
+        "succeeded" => Ok(ActivityStatus::Succeeded),
+        "failed" => Ok(ActivityStatus::Failed),
+        "interrupted" => Ok(ActivityStatus::Interrupted),
+        "indeterminate" => Ok(ActivityStatus::Indeterminate),
+        _ => Err(Neo4jAdapterError::InvalidSemanticProperty { field: "status" }),
     }
 }
 
@@ -965,6 +1114,7 @@ mod tests {
     };
     use harness_graph_ingestion::{ArchiveRoot, DecodedRecordStream, SessionScope};
     use harness_graph_path_analysis::derive_path;
+    use harness_graph_planning::{PrecedentLimit, PrecedentReader};
     use harness_graph_risk::RiskEngine;
     use secrecy::SecretString;
     use url::Url;
@@ -983,6 +1133,72 @@ mod tests {
         let cleanup = adapter.purge_namespace(&namespace).await;
         cleanup?;
         result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires configured real Neo4j and the real Codex archive"]
+    async fn live_neo4j_returns_only_typed_verified_precedents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _dotenv = dotenvy::dotenv().ok();
+        let adapter = connect_from_environment().await?;
+        adapter.health().await?;
+        adapter.ensure_schema().await?;
+        let namespace =
+            GraphNamespace::new(format!("precedent_e2e_{}", uuid::Uuid::now_v7().simple()))?;
+        let result = run_verified_precedent_scenario(&adapter, &namespace).await;
+        let cleanup = adapter.purge_namespace(&namespace).await;
+        cleanup?;
+        result
+    }
+
+    async fn run_verified_precedent_scenario(
+        adapter: &Neo4jAdapter,
+        namespace: &GraphNamespace,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let archive = ArchiveRoot::new(PathBuf::from(required_env(
+            "CODEX_SESSION_RAW_DATA_PATH",
+            "CODEX_SESSION_RAW_DATA_PATH",
+        )?))?;
+        let session_id = SessionId::parse("019c8b3b-2aa8-7183-ba61-379f5b0af31c")?;
+        let bundle = archive
+            .discover(SessionScope::All)?
+            .require(session_id)?
+            .verify()?;
+        let source_digest = bundle.source_digest();
+        let expected_records = bundle.expected_records();
+
+        adapter
+            .project(GraphBatch::first(GraphCommand::UpsertSourceSnapshot(
+                SourceSnapshotCommand::new(
+                    namespace.clone(),
+                    session_id,
+                    source_digest,
+                    expected_records,
+                ),
+            )))
+            .await?;
+        let records: Result<Vec<DecodedNativeRecord>, _> =
+            DecodedRecordStream::open(bundle)?.collect();
+        let records = records?;
+        project_records(adapter, namespace, records.clone()).await?;
+        project_analysis(
+            adapter,
+            AnalysisProjectionCommand::new(
+                namespace.clone(),
+                session_id,
+                source_digest,
+                analyze_records(&records)?,
+            ),
+        )
+        .await?;
+
+        let precedents = adapter
+            .verified_precedents(namespace, PrecedentLimit::new(1)?)
+            .await?;
+        let precedent = precedents.iter().next().ok_or("expected one precedent")?;
+        assert_eq!(precedent.session_id(), session_id);
+        assert_eq!(precedent.steps().count().value(), 34);
+        Ok(())
     }
 
     async fn run_projection_scenario(

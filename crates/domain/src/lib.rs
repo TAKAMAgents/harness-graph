@@ -24,5 +24,5 @@ pub use semantics::{
 };
 pub use value::{
     GraphNamespace, NativeCallId, NativeRecordKind, ObservationId, OccurredAt, RecordCount,
-    RecordSequence, SessionId, ToolName, TurnId,
+    RecordSequence, SessionId, TokenCount, ToolName, TurnId,
 };

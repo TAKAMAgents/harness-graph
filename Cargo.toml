@@ -8,6 +8,8 @@ members = [
     "crates/assurance",
     "crates/risk",
     "crates/path-analysis",
+    "crates/planning",
+    "crates/mistral-adapter",
     "crates/graph-port",
     "crates/neo4j-adapter",
     "crates/cli",
@@ -27,6 +29,8 @@ clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 hex = "0.4"
 neo4rs = "0.8"
+rig = { package = "rig-core", version = "0.40.0" }
+schemars = "1.2"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

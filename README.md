@@ -30,6 +30,11 @@ this prevents unrelated workstation-wide Neo4j settings from silently taking
 precedence. Run commands from a neutral working directory to use process-only
 configuration.
 
+`MISTRAL_API_KEY` is the canonical and required foundation-model credential.
+`MISTRAL_MODEL` defaults to `mistral-small-latest` and rejects model names
+outside Mistral-hosted families. The credential has a redacted debug
+representation and is never included in command output.
+
 ## Historical import
 
 Inspect a verified bundle without touching Neo4j:
@@ -62,14 +67,47 @@ The current projection stores source/session provenance, observations,
 quarantined variants, content-addressed contexts, turns, native-ID-correlated
 tool calls, tools, compressed semantic activities, evidence-derived outcomes,
 risk findings, normalized execution paths, and ingestion receipts. Every
-derived finding retains source-record evidence links. Visualization, aggregate
-path profiles, and Mistral-backed planning remain subsequent vertical slices
-tracked in [`plan.md`](plan.md).
+derived finding retains source-record evidence links. Visualization and
+aggregate path profiles remain subsequent vertical slices tracked in
+[`plan.md`](plan.md).
 
 The verified 621-record golden snapshot currently derives 89 completed tool
 calls and 56 deterministic semantic episodes. These are evidence-preserving
 episodes, not the later 15–25-item Mistral narrative summary; both layers have
 separate contracts in the plan.
+
+## Mistral interpretation and Pathfinder
+
+Verify the configured Mistral credential against the real model catalog:
+
+```bash
+cargo run -p harness-graph-cli -- mistral-health
+```
+
+Create a 15–25-item narrative layer over deterministic activities:
+
+```bash
+cargo run -p harness-graph-cli -- summarize --session-id <uuid>
+```
+
+Rust partitions and owns every activity citation. Mistral supplies bounded
+structured labels only. If Mistral omits a requested group, the adapter retains
+coverage with a deterministic kind-only label and reports its origin as
+`deterministic_fallback`; it never invents missing evidence or silently treats
+the model response as complete.
+
+Retrieve verified-success paths through the typed graph port and ask Mistral
+for a citation-validated plan:
+
+```bash
+cargo run -p harness-graph-cli -- pathfinder \
+  --task "Repair and verify a deprecated configuration under restricted sandboxing" \
+  --precedents 1
+```
+
+Mistral never receives raw Cypher or raw rollout payloads. Candidate session
+and activity citations are rejected unless they belong to the retrieved typed
+precedents.
 
 ## Development commands
 
@@ -85,7 +123,15 @@ The live Neo4j contract test is opt-in and uses the configured local instance:
 
 ```bash
 cargo test -p harness-graph-neo4j-adapter \
-  live_neo4j_projection_is_idempotent -- --ignored
+  --all-features -- --ignored --nocapture
+```
+
+The live Mistral contract test reads the exact project `.env` and requires its
+canonical `MISTRAL_API_KEY`:
+
+```bash
+cargo test -p harness-graph-mistral-adapter \
+  --all-features -- --ignored --nocapture
 ```
 
 Detailed architecture, commands, migration procedures, observability, and
