@@ -368,6 +368,18 @@ fn transcript_dry_run_scans_real_verified_fixture_without_external_clients()
 #[test]
 fn transcript_apply_contract_and_privacy_gates_fail_closed_before_external_clients()
 -> Result<(), Box<dyn std::error::Error>> {
+    let top_level_help = command()?.arg("--help").output()?;
+    assert!(top_level_help.status.success());
+    let top_level_help = String::from_utf8(top_level_help.stdout)?;
+    assert!(top_level_help.contains(
+        "Prepare one authorized transcript locally or apply additive Mistral-to-Neo4j enrichment"
+    ));
+    assert!(top_level_help.contains(
+        "Prepare authorized transcripts locally or apply additive Mistral-to-Neo4j enrichment"
+    ));
+    assert!(!top_level_help.contains("without contacting Mistral or Neo4j"));
+    assert!(!top_level_help.contains("without external mutation"));
+
     let help = command()?
         .args(["enrich-all-transcripts", "--help"])
         .output()?;

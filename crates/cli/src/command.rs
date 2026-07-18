@@ -204,7 +204,7 @@ enum Command {
         #[arg(long, default_value_t = ImportConcurrencyLimit::default())]
         concurrency: ImportConcurrencyLimit,
     },
-    /// Inventory one authorized transcript without contacting Mistral or Neo4j.
+    /// Prepare one authorized transcript locally or apply additive Mistral-to-Neo4j enrichment.
     EnrichTranscripts {
         /// Stable session UUID.
         #[arg(long)]
@@ -218,7 +218,7 @@ enum Command {
         #[command(flatten)]
         execution: TranscriptExecutionArguments,
     },
-    /// Inventory every transcript in an archive scope without external mutation.
+    /// Prepare authorized transcripts locally or apply additive Mistral-to-Neo4j enrichment.
     EnrichAllTranscripts {
         /// Archive scope.
         #[arg(long, value_enum, default_value_t = ScopeArgument::All)]
