@@ -1513,6 +1513,33 @@ uniqueness constraints prevent duplicate projection
 an interrupted session remains replayable without fake completion
 ```
 
+Bulk-import evidence (2026-07-18): the CLI now provides bounded concurrent
+`import-all` execution over active, archived, or deduplicated all-session
+catalogs. Every bundle still passes its complete checksum manifest before
+projection. A typed Neo4j completion probe skips only an exact source digest
+whose namespace, expected count, completed receipt, total, and
+known-plus-quarantined count invariants agree. Session failures settle
+independently, progress is emitted without raw payloads or paths, and any
+partial bulk result exits nonzero after writing its structured summary. The
+same command is therefore safe to resume without treating partial work as
+success. A full-process real-Neo4j regression proves nonzero all-results-settle
+behavior, repair and rerun, and two distinct sessions retaining separate
+`IMPORTED_FROM` provenance while sharing one content-addressed source snapshot.
+
+Live bulk evidence (2026-07-18): an initial four-way archived sweep exposed two
+real composition failures. Older Codex archives report one command result
+through both `event_msg/exec_command_end` and
+`response_item/function_call_output`; the correlator now accumulates these
+mirrored observations associatively, preserves both evidence references,
+prefers a known outcome over an indeterminate mirror, and still rejects a true
+success/failure contradiction. Concurrent Neo4j transactions also contended on
+shared namespace-scoped nodes, so the adapter now serializes mutation
+transactions while checksum verification, decoding, and analysis remain
+bounded and concurrent. After those repairs, all 434 archived sessions settled
+with zero failures: 79 pending sources completed and 355 exact completed
+snapshots were skipped. The configured namespace then contained 125,531 typed
+observations.
+
 ## Phase 3: deterministic semantic compression
 
 Deliver:

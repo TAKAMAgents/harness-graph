@@ -1,6 +1,9 @@
 //! CLI command parsing and orchestration.
 
+use std::{fmt, str::FromStr};
+
 use clap::{Parser, Subcommand, ValueEnum};
+use futures_util::{StreamExt, stream};
 use harness_graph_assurance::assess_outcome;
 use harness_graph_classification::ActivityBuilder;
 use harness_graph_correlation::CorrelationEngine;
@@ -13,10 +16,11 @@ use harness_graph_graph_port::{
     SourceSnapshotCommand,
 };
 use harness_graph_ingestion::{
-    DecodedRecordStream, IngestionError, SessionScope, SourceKind, inspect_bundle,
+    DecodedRecordStream, IngestionError, SessionBundle, SessionScope, SourceKind,
+    VerifiedSessionBundle, inspect_bundle,
 };
 use harness_graph_mistral_adapter::RigMistralAdapter;
-use harness_graph_neo4j_adapter::Neo4jAdapter;
+use harness_graph_neo4j_adapter::{Neo4jAdapter, SourceIngestionStatus};
 use harness_graph_path_analysis::derive_path;
 use harness_graph_planning::{
     ModelUsage, NarrativeInterpreter, NarrativeOrigin, NarrativeRequest, NarrativeSummary,
@@ -51,6 +55,7 @@ pub async fn run() -> Result<(), CliError> {
         Command::Interpret { session_id, task } => interpret(&config, &session_id, task).await,
         Command::Pathfinder { task, precedents } => pathfinder(&config, task, precedents).await,
         Command::Import { session_id } => import(&config, &session_id).await,
+        Command::ImportAll { scope, concurrency } => import_all(&config, scope, concurrency).await,
         Command::Serve => serve(&config).await,
     }
 }
@@ -129,16 +134,71 @@ enum Command {
         #[arg(long)]
         session_id: String,
     },
+    /// Import every verified session in a selected archive scope into Neo4j.
+    ImportAll {
+        /// Archive scope.
+        #[arg(long, value_enum, default_value_t = ScopeArgument::All)]
+        scope: ScopeArgument,
+        /// Maximum simultaneous session imports.
+        #[arg(long, default_value_t = ImportConcurrencyLimit::default())]
+        concurrency: ImportConcurrencyLimit,
+    },
     /// Serve durable live ingestion, replay, and server-sent events.
     Serve,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 enum ScopeArgument {
     Active,
     Archived,
     All,
 }
+
+/// Bounded number of session projections that may advance concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct ImportConcurrencyLimit(usize);
+
+impl ImportConcurrencyLimit {
+    const DEFAULT: usize = 4;
+    const MAX: usize = 8;
+
+    const fn value(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for ImportConcurrencyLimit {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
+    }
+}
+
+impl fmt::Display for ImportConcurrencyLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for ImportConcurrencyLimit {
+    type Err = ImportConcurrencyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value
+            .parse::<usize>()
+            .map_err(|_| ImportConcurrencyParseError)?;
+        if (1..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ImportConcurrencyParseError)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("expected an integer between 1 and 8")]
+struct ImportConcurrencyParseError;
 
 impl From<ScopeArgument> for SessionScope {
     fn from(value: ScopeArgument) -> Self {
@@ -278,6 +338,107 @@ struct ImportOutput {
     total_records: u64,
     observations_in_namespace: u64,
     analysis: AnalysisOutput,
+}
+
+#[derive(Serialize)]
+struct AlreadyCompleteImportOutput {
+    status: &'static str,
+    session_id: String,
+    source_digest: String,
+    expected_records: u64,
+    observations_in_namespace: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(transparent)]
+struct SessionCount(u64);
+
+impl SessionCount {
+    fn increment(&mut self) {
+        self.0 = self.0.saturating_add(1);
+    }
+
+    const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BulkImportStatus {
+    Completed,
+    CompletedWithFailures,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportFailureClass {
+    ArchiveIntegrity,
+    DomainValidation,
+    Correlation,
+    Classification,
+    Assurance,
+    RiskAnalysis,
+    PathAnalysis,
+    GraphProjection,
+    WorkerJoin,
+    RuntimeConfiguration,
+    UnexpectedSubsystem,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum BulkSessionOutput {
+    Imported {
+        session_id: String,
+        source_digest: String,
+        known_records: u64,
+        quarantined_records: u64,
+        total_records: u64,
+        analysis: AnalysisOutput,
+    },
+    AlreadyComplete {
+        session_id: String,
+        source_digest: String,
+        expected_records: u64,
+    },
+    Failed {
+        session_id: String,
+        source_digest: String,
+        failure_class: ImportFailureClass,
+    },
+}
+
+impl BulkSessionOutput {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Imported { session_id, .. }
+            | Self::AlreadyComplete { session_id, .. }
+            | Self::Failed { session_id, .. } => session_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BulkImportOutput {
+    status: BulkImportStatus,
+    scope: ScopeArgument,
+    execution_mode: &'static str,
+    synchronization: &'static str,
+    max_concurrency: ImportConcurrencyLimit,
+    discovered_sessions: SessionCount,
+    imported_sessions: SessionCount,
+    already_complete_sessions: SessionCount,
+    failed_sessions: SessionCount,
+    observations_in_namespace: u64,
+    sessions: Vec<BulkSessionOutput>,
+}
+
+#[derive(Serialize)]
+struct ImportProgressOutput<'a> {
+    event: &'static str,
+    #[serde(flatten)]
+    session: &'a BulkSessionOutput,
 }
 
 #[derive(Serialize)]
@@ -624,17 +785,201 @@ enum PendingBatch {
     Building(GraphBatch),
 }
 
+enum SessionImportResult {
+    Imported(SessionImportReceipt),
+    AlreadyComplete {
+        session_id: SessionId,
+        source_digest: harness_graph_domain::SourceDigest,
+        expected_records: RecordCount,
+    },
+}
+
+struct SessionImportReceipt {
+    session_id: SessionId,
+    source_digest: harness_graph_domain::SourceDigest,
+    known_records: RecordCount,
+    quarantined_records: RecordCount,
+    total_records: RecordCount,
+    analysis: AnalysisOutput,
+}
+
 async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     let session_id = SessionId::parse(session_id)?;
     let catalog = config.archive_root().discover(SessionScope::All)?;
     let verified = catalog.require(session_id)?.verify()?;
+    let adapter = connect_neo4j(config).await?;
+    adapter.health().await?;
+    adapter.ensure_schema().await?;
+    match import_verified_session(config, &adapter, verified).await? {
+        SessionImportResult::Imported(receipt) => {
+            let observations_in_namespace =
+                adapter.observation_count(config.graph_namespace()).await?;
+            write_json(&ImportOutput {
+                status: "imported",
+                session_id: receipt.session_id.to_string(),
+                source_digest: receipt.source_digest.to_hex(),
+                known_records: receipt.known_records.value(),
+                quarantined_records: receipt.quarantined_records.value(),
+                total_records: receipt.total_records.value(),
+                observations_in_namespace: observations_in_namespace.value(),
+                analysis: receipt.analysis,
+            })
+        }
+        SessionImportResult::AlreadyComplete {
+            session_id,
+            source_digest,
+            expected_records,
+        } => {
+            let observations_in_namespace =
+                adapter.observation_count(config.graph_namespace()).await?;
+            write_json(&AlreadyCompleteImportOutput {
+                status: "already_complete",
+                session_id: session_id.to_string(),
+                source_digest: source_digest.to_hex(),
+                expected_records: expected_records.value(),
+                observations_in_namespace: observations_in_namespace.value(),
+            })
+        }
+    }
+}
+
+async fn import_all(
+    config: &AppConfig,
+    scope: ScopeArgument,
+    concurrency: ImportConcurrencyLimit,
+) -> Result<(), CliError> {
+    let catalog = config.archive_root().discover(scope.into())?;
+    let adapter = connect_neo4j(config).await?;
+    adapter.health().await?;
+    adapter.ensure_schema().await?;
+
+    let mut settlements = stream::iter(catalog.iter().cloned().map(|bundle| {
+        let adapter = adapter.clone();
+        async move { settle_session_import(config, &adapter, bundle).await }
+    }))
+    .buffer_unordered(concurrency.value());
+
+    let mut discovered_sessions = SessionCount::default();
+    let mut imported_sessions = SessionCount::default();
+    let mut already_complete_sessions = SessionCount::default();
+    let mut failed_sessions = SessionCount::default();
+    let mut progress_error = None;
+    let mut sessions = Vec::with_capacity(catalog.len());
+    while let Some(settlement) = settlements.next().await {
+        discovered_sessions.increment();
+        let output = match settlement.result {
+            Ok(SessionImportResult::Imported(receipt)) => {
+                imported_sessions.increment();
+                BulkSessionOutput::Imported {
+                    session_id: receipt.session_id.to_string(),
+                    source_digest: receipt.source_digest.to_hex(),
+                    known_records: receipt.known_records.value(),
+                    quarantined_records: receipt.quarantined_records.value(),
+                    total_records: receipt.total_records.value(),
+                    analysis: receipt.analysis,
+                }
+            }
+            Ok(SessionImportResult::AlreadyComplete {
+                session_id,
+                source_digest,
+                expected_records,
+            }) => {
+                already_complete_sessions.increment();
+                BulkSessionOutput::AlreadyComplete {
+                    session_id: session_id.to_string(),
+                    source_digest: source_digest.to_hex(),
+                    expected_records: expected_records.value(),
+                }
+            }
+            Err(error) => {
+                failed_sessions.increment();
+                BulkSessionOutput::Failed {
+                    session_id: settlement.session_id.to_string(),
+                    source_digest: settlement.source_digest.to_hex(),
+                    failure_class: import_failure_class(&error),
+                }
+            }
+        };
+        let progress_result = write_progress_json(&ImportProgressOutput {
+            event: "session_import_settled",
+            session: &output,
+        });
+        if progress_error.is_none() {
+            progress_error = progress_result.err();
+        }
+        sessions.push(output);
+    }
+    sessions.sort_by(|left, right| left.session_id().cmp(right.session_id()));
+
+    let observations_in_namespace = adapter.observation_count(config.graph_namespace()).await?;
+    let has_failures = !failed_sessions.is_zero();
+    let status = if has_failures {
+        BulkImportStatus::CompletedWithFailures
+    } else {
+        BulkImportStatus::Completed
+    };
+    write_json(&BulkImportOutput {
+        status,
+        scope,
+        execution_mode: "concurrent",
+        synchronization: "all_results_settle",
+        max_concurrency: concurrency,
+        discovered_sessions,
+        imported_sessions,
+        already_complete_sessions,
+        failed_sessions,
+        observations_in_namespace: observations_in_namespace.value(),
+        sessions,
+    })?;
+    if has_failures {
+        Err(CliError::BulkImportIncomplete)
+    } else {
+        match progress_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+struct SessionImportSettlement {
+    session_id: SessionId,
+    source_digest: harness_graph_domain::SourceDigest,
+    result: Result<SessionImportResult, CliError>,
+}
+
+async fn settle_session_import(
+    config: &AppConfig,
+    adapter: &Neo4jAdapter,
+    bundle: SessionBundle,
+) -> SessionImportSettlement {
+    let session_id = bundle.session_id();
+    let source_digest = bundle.source_digest();
+    let result = match tokio::task::spawn_blocking(move || bundle.verify()).await {
+        Ok(Ok(verified)) => import_verified_session(config, adapter, verified).await,
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(CliError::ImportWorkerJoin),
+    };
+    SessionImportSettlement {
+        session_id,
+        source_digest,
+        result,
+    }
+}
+
+async fn import_verified_session(
+    config: &AppConfig,
+    adapter: &Neo4jAdapter,
+    verified: VerifiedSessionBundle,
+) -> Result<SessionImportResult, CliError> {
+    let session_id = verified.session_id();
     let source_digest = verified.source_digest();
     let expected_records = verified.expected_records();
     let namespace = config.graph_namespace().clone();
 
-    let adapter = connect_neo4j(config).await?;
-    adapter.health().await?;
-    adapter.ensure_schema().await?;
+    // Source receipts are content-addressed, while session provenance is not.
+    // Always materialize the idempotent session-to-source edge before using a
+    // completed receipt to skip record replay: distinct sessions may contain
+    // the same exact source bytes.
     adapter
         .project(GraphBatch::first(GraphCommand::UpsertSourceSnapshot(
             SourceSnapshotCommand::new(
@@ -645,6 +990,18 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
             ),
         )))
         .await?;
+
+    if adapter
+        .source_ingestion_status(&namespace, source_digest, expected_records)
+        .await?
+        == SourceIngestionStatus::Complete
+    {
+        return Ok(SessionImportResult::AlreadyComplete {
+            session_id,
+            source_digest,
+            expected_records,
+        });
+    }
 
     let mut known_records = RecordCount::default();
     let mut quarantined_records = RecordCount::default();
@@ -664,7 +1021,7 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
             record,
         };
         pending = append_or_project(
-            &adapter,
+            adapter,
             std::mem::replace(&mut pending, PendingBatch::Empty),
             command,
             config.graph_batch_size(),
@@ -696,17 +1053,14 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
             ),
         )))
         .await?;
-    let observations_in_namespace = adapter.observation_count(&namespace).await?;
-    write_json(&ImportOutput {
-        status: "imported",
-        session_id: session_id.to_string(),
-        source_digest: source_digest.to_hex(),
-        known_records: known_records.value(),
-        quarantined_records: quarantined_records.value(),
-        total_records: total_records.value(),
-        observations_in_namespace: observations_in_namespace.value(),
+    Ok(SessionImportResult::Imported(SessionImportReceipt {
+        session_id,
+        source_digest,
+        known_records,
+        quarantined_records,
+        total_records,
         analysis: analysis_output,
-    })
+    }))
 }
 
 async fn connect_neo4j(config: &AppConfig) -> Result<Neo4jAdapter, CliError> {
@@ -781,6 +1135,40 @@ fn source_kind_name(source_kind: SourceKind) -> &'static str {
         SourceKind::Active => "active",
         SourceKind::Archived => "archived",
     }
+}
+
+const fn import_failure_class(error: &CliError) -> ImportFailureClass {
+    match error {
+        CliError::ConfigurationFile
+        | CliError::MissingConfiguration { .. }
+        | CliError::InvalidConfiguration { .. } => ImportFailureClass::RuntimeConfiguration,
+        CliError::Domain(_) => ImportFailureClass::DomainValidation,
+        CliError::Ingestion(_) => ImportFailureClass::ArchiveIntegrity,
+        CliError::Correlation(_) => ImportFailureClass::Correlation,
+        CliError::Classification(_) => ImportFailureClass::Classification,
+        CliError::Assurance(_) => ImportFailureClass::Assurance,
+        CliError::Risk(_) => ImportFailureClass::RiskAnalysis,
+        CliError::PathAnalysis(_) => ImportFailureClass::PathAnalysis,
+        CliError::GraphPort(_) | CliError::Neo4j(_) => ImportFailureClass::GraphProjection,
+        CliError::ImportWorkerJoin => ImportFailureClass::WorkerJoin,
+        CliError::BulkImportIncomplete
+        | CliError::Mistral(_)
+        | CliError::Planning(_)
+        | CliError::Journal(_)
+        | CliError::Server { .. }
+        | CliError::OutputEncoding { .. }
+        | CliError::OutputWrite { .. }
+        | CliError::Logging { .. } => ImportFailureClass::UnexpectedSubsystem,
+    }
+}
+
+fn write_progress_json(value: &impl Serialize) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    let mut stderr = std::io::stderr().lock();
+    serde_json::to_writer(&mut stderr, value)
+        .map_err(|source| CliError::OutputEncoding { source })?;
+    writeln!(stderr).map_err(|source| CliError::OutputWrite { source })
 }
 
 fn write_json(value: &impl Serialize) -> Result<(), CliError> {

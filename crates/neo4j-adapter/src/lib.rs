@@ -1,5 +1,7 @@
 //! Neo4j implementation of the typed graph projection port.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use harness_graph_domain::{
     ActivityInvocation, CallAssociation, ContextAssociation, CorrelatedInvocation,
@@ -16,6 +18,7 @@ use harness_graph_planning::{
 };
 use neo4rs::{Graph, Query, query};
 use secrecy::{ExposeSecret, SecretString};
+use tokio::sync::Mutex;
 
 /// Neo4j adapter failure with secret-safe operation context.
 #[derive(Debug, thiserror::Error)]
@@ -76,10 +79,25 @@ pub enum Neo4jAdapterError {
     Domain(#[from] harness_graph_domain::DomainError),
 }
 
+/// Exact completion state for one content-addressed source snapshot.
+///
+/// `Pending` intentionally covers both a missing receipt and any receipt whose
+/// namespace, digest, status, relationship, or record-count invariants do not
+/// match the requested verified snapshot. Callers may therefore skip work only
+/// for `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIngestionStatus {
+    /// The completed receipt exists and all source and count invariants agree.
+    Complete,
+    /// No trustworthy completed receipt exists for the exact source snapshot.
+    Pending,
+}
+
 /// Concrete idempotent Neo4j graph adapter.
 #[derive(Clone)]
 pub struct Neo4jAdapter {
     graph: Graph,
+    projection_gate: Arc<Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -105,7 +123,10 @@ impl Neo4jAdapter {
         let graph = Graph::new(bolt_address, username, password.expose_secret())
             .await
             .map_err(|source| Neo4jAdapterError::Connection { source })?;
-        Ok(Self { graph })
+        Ok(Self {
+            graph,
+            projection_gate: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Count projected observations in one graph namespace.
@@ -144,6 +165,76 @@ impl Neo4jAdapter {
         let count =
             u64::try_from(count).map_err(|_| Neo4jAdapterError::IntegerRange { field: "count" })?;
         Ok(RecordCount::new(count))
+    }
+
+    /// Read the trustworthy completion state for one exact source snapshot.
+    ///
+    /// A source is complete only when its snapshot metadata agrees with
+    /// `expected_records` and a linked completed receipt reports the same total
+    /// with known and quarantined counts that add up to that total. Missing or
+    /// inconsistent graph state is reported as [`SourceIngestionStatus::Pending`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the expected count cannot fit Neo4j's integer
+    /// model or Neo4j cannot execute or decode the parameterized query.
+    pub async fn source_ingestion_status(
+        &self,
+        namespace: &GraphNamespace,
+        source_digest: SourceDigest,
+        expected_records: RecordCount,
+    ) -> Result<SourceIngestionStatus, Neo4jAdapterError> {
+        let source_digest = source_digest.to_hex();
+        let expected_records = to_i64(expected_records.value(), "source expected records")?;
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "OPTIONAL MATCH (src:HGSourceSnapshot {key: $source_key}) \
+                     OPTIONAL MATCH (r:HGIngestionReceipt {key: $receipt_key})-[:VERIFIED]->(src) \
+                     RETURN coalesce( \
+                         src.hg_namespace = $namespace AND \
+                         src.source_digest = $source_digest AND \
+                         src.expected_records = $expected_records AND \
+                         r.hg_namespace = $namespace AND \
+                         r.source_digest = $source_digest AND \
+                         r.status = 'completed' AND \
+                         r.completed_at IS NOT NULL AND \
+                         r.total_records = $expected_records AND \
+                         r.known_records + r.quarantined_records = r.total_records, \
+                         false \
+                     ) AS completed",
+                )
+                .param("source_key", source_key(namespace.as_str(), &source_digest))
+                .param(
+                    "receipt_key",
+                    receipt_key(namespace.as_str(), &source_digest),
+                )
+                .param("namespace", namespace.as_str())
+                .param("source_digest", source_digest)
+                .param("expected_records", expected_records),
+            )
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "read source ingestion status",
+                source,
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "decode source ingestion status",
+                source,
+            })?
+            .ok_or(Neo4jAdapterError::InvalidReadResult { field: "completed" })?;
+        let completed: bool = row
+            .get("completed")
+            .map_err(|_| Neo4jAdapterError::InvalidReadResult { field: "completed" })?;
+        Ok(if completed {
+            SourceIngestionStatus::Complete
+        } else {
+            SourceIngestionStatus::Pending
+        })
     }
 
     #[cfg(test)]
@@ -196,6 +287,30 @@ impl Neo4jAdapter {
         row.get("completed_at")
             .map_err(|_| Neo4jAdapterError::InvalidReadResult {
                 field: "completed_at",
+            })
+    }
+
+    #[cfg(test)]
+    async fn corrupt_receipt_counts(
+        &self,
+        namespace: &GraphNamespace,
+        source_digest: SourceDigest,
+    ) -> Result<(), Neo4jAdapterError> {
+        self.graph
+            .run(
+                query(
+                    "MATCH (r:HGIngestionReceipt {key: $receipt_key}) \
+                     SET r.known_records = 0, r.quarantined_records = 0",
+                )
+                .param(
+                    "receipt_key",
+                    receipt_key(namespace.as_str(), &source_digest.to_hex()),
+                ),
+            )
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "corrupt isolated test receipt",
+                source,
             })
     }
 
@@ -296,6 +411,11 @@ impl GraphProjector for Neo4jAdapter {
     }
 
     async fn project(&self, batch: GraphBatch) -> Result<ProjectionReceipt, Self::Error> {
+        // Independent archive verification and analysis remain concurrent, but
+        // projections touch shared namespace-scoped nodes such as HGTool.
+        // Serializing only mutation transactions prevents Neo4j uniqueness-lock
+        // races while retaining bounded concurrency outside this critical section.
+        let _projection_guard = self.projection_gate.lock().await;
         let logical_count = to_i64(batch.command_count().value(), "batch command count")?;
         let mut queries = Vec::new();
         for command in batch.into_commands() {
@@ -768,10 +888,10 @@ fn finalize_queries(command: &FinalizeIngestionCommand) -> Result<Vec<Query>, Ne
         query(
             "MATCH (src:HGSourceSnapshot {key: $source_key}) \
          MERGE (r:HGIngestionReceipt {key: $receipt_key}) \
-         ON CREATE SET r.hg_namespace = $namespace, r.source_digest = $source_digest, \
+         SET r.hg_namespace = $namespace, r.source_digest = $source_digest, \
              r.status = 'completed', r.known_records = $known_records, \
              r.quarantined_records = $quarantined_records, r.total_records = $total_records, \
-             r.completed_at = datetime() \
+             r.completed_at = coalesce(r.completed_at, datetime()) \
          MERGE (r)-[:VERIFIED]->(src)",
         )
         .param("source_key", source_key(namespace, &source_digest))
@@ -1106,7 +1226,7 @@ mod tests {
     use harness_graph_classification::ActivityBuilder;
     use harness_graph_correlation::CorrelationEngine;
     use harness_graph_domain::{
-        AnalysisReport, DecodedNativeRecord, GraphNamespace, RecordCount, SessionId,
+        AnalysisReport, DecodedNativeRecord, GraphNamespace, RecordCount, SessionId, SourceDigest,
     };
     use harness_graph_graph_port::{
         AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand,
@@ -1119,7 +1239,7 @@ mod tests {
     use secrecy::SecretString;
     use url::Url;
 
-    use super::Neo4jAdapter;
+    use super::{Neo4jAdapter, SourceIngestionStatus};
 
     #[tokio::test]
     #[ignore = "requires configured real Neo4j"]
@@ -1215,6 +1335,13 @@ mod tests {
         let source_digest = bundle.source_digest();
         let expected_records = bundle.expected_records();
 
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, expected_records)
+                .await?,
+            SourceIngestionStatus::Pending
+        );
+
         adapter
             .project(GraphBatch::first(GraphCommand::UpsertSourceSnapshot(
                 SourceSnapshotCommand::new(
@@ -1237,6 +1364,13 @@ mod tests {
         project_analysis(adapter, analysis_command.clone()).await?;
         project_analysis(adapter, analysis_command).await?;
 
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, expected_records)
+                .await?,
+            SourceIngestionStatus::Pending
+        );
+
         let receipt = FinalizeIngestionCommand::new(
             namespace.clone(),
             session_id,
@@ -1249,6 +1383,28 @@ mod tests {
         let first_completed_at = adapter
             .receipt_completed_at(namespace, source_digest)
             .await?;
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, expected_records)
+                .await?,
+            SourceIngestionStatus::Complete
+        );
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, RecordCount::new(13))
+                .await?,
+            SourceIngestionStatus::Pending
+        );
+
+        assert_receipt_repair(
+            adapter,
+            namespace,
+            source_digest,
+            expected_records,
+            &receipt,
+            &first_completed_at,
+        )
+        .await?;
 
         project_records(adapter, namespace, records).await?;
         project_receipt(adapter, receipt).await?;
@@ -1266,6 +1422,45 @@ mod tests {
             }
         );
         assert_eq!(first_completed_at, second_completed_at);
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, expected_records)
+                .await?,
+            SourceIngestionStatus::Complete
+        );
+        Ok(())
+    }
+
+    async fn assert_receipt_repair(
+        adapter: &Neo4jAdapter,
+        namespace: &GraphNamespace,
+        source_digest: SourceDigest,
+        expected_records: RecordCount,
+        receipt: &FinalizeIngestionCommand,
+        original_completed_at: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        adapter
+            .corrupt_receipt_counts(namespace, source_digest)
+            .await?;
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, expected_records)
+                .await?,
+            SourceIngestionStatus::Pending
+        );
+        project_receipt(adapter, receipt.clone()).await?;
+        assert_eq!(
+            adapter
+                .source_ingestion_status(namespace, source_digest, expected_records)
+                .await?,
+            SourceIngestionStatus::Complete
+        );
+        assert_eq!(
+            original_completed_at,
+            adapter
+                .receipt_completed_at(namespace, source_digest)
+                .await?
+        );
         Ok(())
     }
 

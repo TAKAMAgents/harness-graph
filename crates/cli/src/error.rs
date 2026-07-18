@@ -80,6 +80,14 @@ pub enum CliError {
     #[error(transparent)]
     Neo4j(#[from] Neo4jAdapterError),
 
+    /// A blocking archive verification worker did not complete normally.
+    #[error("archive verification worker did not complete")]
+    ImportWorkerJoin,
+
+    /// Bulk import settled every session but at least one session failed.
+    #[error("bulk import completed with one or more failed sessions")]
+    BulkImportIncomplete,
+
     /// Append-only live journal validation or durability failed.
     #[error(transparent)]
     Journal(#[from] JournalError),
@@ -98,6 +106,14 @@ pub enum CliError {
         /// JSON encoder error.
         #[source]
         source: serde_json::Error,
+    },
+
+    /// Structured progress output could not be written to the process stream.
+    #[error("failed to write structured command output: {source}")]
+    OutputWrite {
+        /// Output stream error.
+        #[source]
+        source: std::io::Error,
     },
 
     /// Logging initialization failed.

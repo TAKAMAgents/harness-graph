@@ -14,6 +14,7 @@ path = "src/main.rs"
 axum.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
+futures-util.workspace = true
 harness-graph-api = { path = "../api" }
 harness-graph-assurance = { path = "../assurance" }
 harness-graph-classification = { path = "../classification" }
@@ -37,7 +38,9 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+neo4rs.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
+sha2.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
 

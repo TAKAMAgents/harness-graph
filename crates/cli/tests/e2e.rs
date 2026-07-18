@@ -1,13 +1,18 @@
 //! Full-process E2E coverage for the foundation ingestion slice.
 
 use std::{
+    collections::BTreeMap,
     io::Write,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
+use neo4rs::{Graph, query};
+use sha2::{Digest, Sha256};
+
 const SESSION_ID: &str = "019c63db-2995-74c3-b898-c1b92a8e1317";
+const SECOND_SESSION_ID: &str = "019c63db-2995-74c3-b898-c1b92a8e1318";
 
 fn fixture_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -30,6 +35,84 @@ fn command() -> Result<Command, Box<dyn std::error::Error>> {
     Ok(command)
 }
 
+struct RepositoryEnvironment {
+    neo4j_url: String,
+    neo4j_username: String,
+    neo4j_password: String,
+    mistral_api_key: String,
+    mistral_model: String,
+}
+
+impl RepositoryEnvironment {
+    fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let values = dotenvy::from_path_iter(repository_root.join(".env"))?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(Self {
+            neo4j_url: required_environment_value(
+                &values,
+                "NEO4J_CONNECTION_URL",
+                "NEO4J_CONECTION_URL",
+            )?,
+            neo4j_username: values
+                .get("NEO4J_USERNAME")
+                .cloned()
+                .unwrap_or_else(|| "neo4j".to_owned()),
+            neo4j_password: required_environment_value(
+                &values,
+                "NEO4J_PASSWORD",
+                "NEO4J_INATANSE_PASSWORD",
+            )?,
+            mistral_api_key: values
+                .get("MISTRAL_API_KEY")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .ok_or("repository .env is missing MISTRAL_API_KEY")?,
+            mistral_model: values
+                .get("MISTRAL_MODEL")
+                .cloned()
+                .unwrap_or_else(|| "mistral-small-latest".to_owned()),
+        })
+    }
+
+    fn command(&self, archive_root: &Path, namespace: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harness-graph"));
+        command
+            .current_dir(std::env::temp_dir())
+            .env("CODEX_SESSION_RAW_DATA_PATH", archive_root)
+            .env("NEO4J_CONNECTION_URL", &self.neo4j_url)
+            .env("NEO4J_USERNAME", &self.neo4j_username)
+            .env("NEO4J_PASSWORD", &self.neo4j_password)
+            .env("HARNESS_GRAPH_NAMESPACE", namespace)
+            .env("MISTRAL_API_KEY", &self.mistral_api_key)
+            .env("MISTRAL_MODEL", &self.mistral_model)
+            .env_remove("NEO4J_CONECTION_URL")
+            .env_remove("NEO4J_INATANSE_PASSWORD")
+            .env_remove("MISTARL_API_KEY");
+        command
+    }
+
+    async fn graph(&self) -> Result<Graph, Box<dyn std::error::Error>> {
+        let url = url::Url::parse(&self.neo4j_url)?;
+        let host = url.host_str().ok_or("Neo4j URL is missing a host")?;
+        let bolt_address = format!("{host}:{}", url.port().unwrap_or(7687));
+        Ok(Graph::new(&bolt_address, &self.neo4j_username, &self.neo4j_password).await?)
+    }
+}
+
+fn required_environment_value(
+    values: &BTreeMap<String, String>,
+    canonical_name: &'static str,
+    legacy_name: &'static str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    values
+        .get(canonical_name)
+        .or_else(|| values.get(legacy_name))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| format!("repository .env is missing {canonical_name}").into())
+}
+
 fn run_json(arguments: &[&str]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let output = command()?.args(arguments).output()?;
     if !output.status.success() {
@@ -50,6 +133,24 @@ fn doctor_reports_mistral_without_exposing_secrets() -> Result<(), Box<dyn std::
     assert!(stdout.contains("\"foundation_model_provider\": \"mistral\""));
     assert!(!stdout.contains("source-safe-test-key"));
     assert!(!stdout.contains("source-safe-test-password"));
+    Ok(())
+}
+
+#[test]
+fn bulk_import_exposes_bounded_concurrency_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let help = command()?.args(["import-all", "--help"]).output()?;
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout)?;
+    assert!(stdout.contains("--scope"));
+    assert!(stdout.contains("--concurrency"));
+
+    for invalid in ["0", "9"] {
+        let output = command()?
+            .args(["import-all", "--concurrency", invalid])
+            .output()?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8(output.stderr)?.contains("expected an integer between 1 and 8"));
+    }
     Ok(())
 }
 
@@ -119,6 +220,238 @@ fn tampered_bundle_fails_before_semantic_parsing() -> Result<(), Box<dyn std::er
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr)?.contains("checksum verification failed"));
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the real Neo4j credentials from the repository .env"]
+async fn bulk_import_settles_repairs_and_preserves_shared_source_provenance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let environment = RepositoryEnvironment::load()?;
+    let temporary = tempfile::tempdir()?;
+    let first_bundle = temporary.path().join("active/2026-02-16").join(SESSION_ID);
+    let second_bundle = temporary
+        .path()
+        .join("active/2026-02-16")
+        .join(SECOND_SESSION_ID);
+    create_source_safe_bundle(&first_bundle, SESSION_ID)?;
+    create_source_safe_bundle(&second_bundle, SECOND_SESSION_ID)?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(second_bundle.join("raw/rollout.jsonl"))?
+        .write_all(b"\n")?;
+
+    let namespace = format!("cli_bulk_e2e_{}", uuid::Uuid::now_v7().simple());
+    let graph = environment.graph().await?;
+    let scenario = run_bulk_import_scenario(
+        &environment,
+        &graph,
+        temporary.path(),
+        &second_bundle,
+        &namespace,
+    )
+    .await;
+    let cleanup = purge_namespace(&graph, &namespace).await;
+    scenario?;
+    cleanup?;
+    Ok(())
+}
+
+async fn run_bulk_import_scenario(
+    environment: &RepositoryEnvironment,
+    graph: &Graph,
+    archive_root: &Path,
+    second_bundle: &Path,
+    namespace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let first = run_bulk_import(environment, archive_root, namespace)?;
+    ensure(
+        !first.status.success(),
+        "tampered sweep unexpectedly succeeded",
+    )?;
+    ensure_secret_safe(environment, &first)?;
+    let first_summary: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    ensure(
+        first_summary["status"] == "completed_with_failures",
+        "tampered sweep did not settle with failures",
+    )?;
+    ensure(
+        first_summary["discovered_sessions"] == 2
+            && first_summary["imported_sessions"] == 1
+            && first_summary["failed_sessions"] == 1,
+        "tampered sweep session counts were incorrect",
+    )?;
+    ensure(
+        first_summary["sessions"]
+            .as_array()
+            .is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    session["session_id"] == SECOND_SESSION_ID
+                        && session["status"] == "failed"
+                        && session["failure_class"] == "archive_integrity"
+                })
+            }),
+        "tampered session did not report an archive-integrity failure",
+    )?;
+
+    std::fs::copy(
+        fixture_root()?
+            .join("active/2026-02-16")
+            .join(SESSION_ID)
+            .join("raw/rollout.jsonl"),
+        second_bundle.join("raw/rollout.jsonl"),
+    )?;
+    let second = run_bulk_import(environment, archive_root, namespace)?;
+    ensure(second.status.success(), "repaired sweep failed")?;
+    ensure_secret_safe(environment, &second)?;
+    let second_summary: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    ensure(
+        second_summary["status"] == "completed"
+            && second_summary["already_complete_sessions"] == 2
+            && second_summary["imported_sessions"] == 0
+            && second_summary["failed_sessions"] == 0,
+        "repaired sweep did not skip both completed source snapshots",
+    )?;
+    let sessions = second_summary["sessions"]
+        .as_array()
+        .ok_or("repaired sweep omitted session settlements")?;
+    ensure(
+        sessions.len() == 2
+            && sessions
+                .iter()
+                .all(|session| session["status"] == "already_complete")
+            && sessions[0]["source_digest"] == sessions[1]["source_digest"],
+        "repaired sessions did not share one completed raw digest",
+    )?;
+
+    let counts = graph_counts(graph, namespace).await?;
+    ensure(
+        counts
+            == GraphCounts {
+                sessions: 2,
+                provenance_edges: 2,
+                sources: 1,
+                observations: 12,
+            },
+        "Neo4j provenance counts did not preserve two sessions and one source",
+    )
+}
+
+fn run_bulk_import(
+    environment: &RepositoryEnvironment,
+    archive_root: &Path,
+    namespace: &str,
+) -> Result<Output, std::io::Error> {
+    environment
+        .command(archive_root, namespace)
+        .args(["import-all", "--scope", "active", "--concurrency", "2"])
+        .output()
+}
+
+fn ensure_secret_safe(
+    environment: &RepositoryEnvironment,
+    output: &Output,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        !stdout.contains(&environment.neo4j_password)
+            && !stderr.contains(&environment.neo4j_password)
+            && !stdout.contains(&environment.mistral_api_key)
+            && !stderr.contains(&environment.mistral_api_key),
+        "CLI output exposed a configured secret",
+    )
+}
+
+fn create_source_safe_bundle(
+    destination: &Path,
+    session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = fixture_root()?.join("active/2026-02-16").join(SESSION_ID);
+    std::fs::create_dir_all(destination.join("raw"))?;
+    std::fs::copy(source.join("README.md"), destination.join("README.md"))?;
+    std::fs::copy(
+        source.join("raw/rollout.jsonl"),
+        destination.join("raw/rollout.jsonl"),
+    )?;
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(source.join("metadata.json"))?)?;
+    metadata["session_id"] = serde_json::Value::String(session_id.to_owned());
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+    std::fs::write(destination.join("metadata.json"), &metadata_bytes)?;
+    let manifest = format!(
+        "{}  README.md\n{}  metadata.json\n{}  raw/rollout.jsonl\n",
+        sha256_file(&destination.join("README.md"))?,
+        sha256_bytes(&metadata_bytes),
+        sha256_file(&destination.join("raw/rollout.jsonl"))?,
+    );
+    std::fs::write(destination.join("checksums.sha256"), manifest)?;
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    std::fs::read(path).map(|bytes| sha256_bytes(&bytes))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GraphCounts {
+    sessions: i64,
+    provenance_edges: i64,
+    sources: i64,
+    observations: i64,
+}
+
+async fn graph_counts(
+    graph: &Graph,
+    namespace: &str,
+) -> Result<GraphCounts, Box<dyn std::error::Error>> {
+    let mut rows = graph
+        .execute(
+            query(
+                "MATCH (session:HGSession {hg_namespace: $namespace}) \
+                 OPTIONAL MATCH (session)-[edge:IMPORTED_FROM]->\
+                     (source:HGSourceSnapshot {hg_namespace: $namespace}) \
+                 WITH count(DISTINCT session) AS sessions, \
+                      count(DISTINCT edge) AS provenance_edges, \
+                      count(DISTINCT source) AS sources \
+                 MATCH (observation:HGObservation {hg_namespace: $namespace}) \
+                 RETURN sessions, provenance_edges, sources, \
+                        count(observation) AS observations",
+            )
+            .param("namespace", namespace),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or("Neo4j count query returned no row")?;
+    Ok(GraphCounts {
+        sessions: row.get("sessions")?,
+        provenance_edges: row.get("provenance_edges")?,
+        sources: row.get("sources")?,
+        observations: row.get("observations")?,
+    })
+}
+
+async fn purge_namespace(graph: &Graph, namespace: &str) -> Result<(), Box<dyn std::error::Error>> {
+    graph
+        .run(
+            query("MATCH (node {hg_namespace: $namespace}) DETACH DELETE node")
+                .param("namespace", namespace),
+        )
+        .await?;
+    Ok(())
+}
+
+fn ensure(condition: bool, message: &'static str) -> Result<(), Box<dyn std::error::Error>> {
+    if condition {
+        Ok(())
+    } else {
+        Err(message.into())
+    }
 }
 
 #[tokio::test]

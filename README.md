@@ -61,11 +61,34 @@ Project it into Neo4j:
 cargo run -p harness-graph-cli -- import --session-id <uuid>
 ```
 
+Project every published session with bounded concurrency:
+
+```bash
+cargo run --release -p harness-graph-cli -- \
+  import-all --scope all --concurrency 4
+```
+
+`import-all` shares one Neo4j connection pool, verifies session checksums on a
+bounded blocking-worker set, and settles independent session imports
+concurrently while preserving record order inside each session. Mutation
+transactions alone pass through a shared adapter gate because otherwise
+concurrent sessions can contend on namespace-scoped nodes such as `HGTool`;
+checksum verification, decoding, and analysis remain concurrent. The command
+emits one source-safe JSON settlement to stderr as each session finishes and a
+sorted summary to stdout. Session-to-source provenance is always materialized
+before exact source snapshots with a consistent completed receipt are reported
+as `already_complete`, so distinct sessions that share identical source bytes
+remain visible without replaying the observations. Individual failures do not
+cancel unrelated imports; the final summary is `completed_with_failures` and
+the process exits nonzero when any session fails, so the same command can be
+rerun safely after repair.
+
 The importer validates the complete checksum manifest first, streams canonical
 records in bounded transactions, creates idempotent uniqueness constraints,
 and writes a completion receipt only after the streamed count matches verified
 metadata. Repeating the same import preserves one observation per source
-digest and sequence. `HARNESS_GRAPH_NAMESPACE` isolates graph populations and
+digest and sequence, and a trustworthy receipt avoids replaying an already
+complete snapshot. `HARNESS_GRAPH_NAMESPACE` isolates graph populations and
 `HARNESS_GRAPH_BATCH_SIZE` controls the validated transaction bound.
 
 The current projection stores source/session provenance, observations,

@@ -16,6 +16,7 @@ secrecy.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -26,7 +27,6 @@ harness-graph-correlation = { path = "../correlation" }
 harness-graph-ingestion = { path = "../ingestion" }
 harness-graph-path-analysis = { path = "../path-analysis" }
 harness-graph-risk = { path = "../risk" }
-tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
 

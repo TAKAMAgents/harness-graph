@@ -16,9 +16,14 @@ pub enum CorrelationError {
     #[error("native call identity has multiple request observations")]
     DuplicateRequest,
 
-    /// Multiple distinct results used one native call identity.
-    #[error("native call identity has multiple result observations")]
-    DuplicateResult,
+    /// Result evidence for one native call asserted both success and failure.
+    #[error("native call identity has conflicting result outcomes: {existing:?} and {incoming:?}")]
+    ConflictingResultOutcomes {
+        /// Outcome already accumulated for the native call.
+        existing: ToolOutcome,
+        /// Contradictory outcome supplied by the new observation.
+        incoming: ToolOutcome,
+    },
 
     /// An incremental lifecycle transition attempted to move backward.
     #[error("illegal tool-call lifecycle transition")]
@@ -40,8 +45,32 @@ struct RequestEvidence {
 
 #[derive(Debug, Clone)]
 struct ResultEvidence {
-    source: SourceRecordRef,
     outcome: ToolOutcome,
+    sources: Vec<SourceRecordRef>,
+}
+
+impl ResultEvidence {
+    fn new(source: SourceRecordRef, outcome: ToolOutcome) -> Self {
+        Self {
+            outcome,
+            sources: vec![source],
+        }
+    }
+
+    fn merge(
+        &mut self,
+        source: SourceRecordRef,
+        incoming: ToolOutcome,
+    ) -> Result<(), CorrelationError> {
+        let outcome = merge_outcomes(self.outcome, incoming)?;
+        if !self.sources.contains(&source) {
+            self.sources.push(source);
+            self.sources
+                .sort_by_key(|evidence| evidence.sequence().value());
+        }
+        self.outcome = outcome;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -156,24 +185,39 @@ impl CorrelationEngine {
             OutcomeAssociation::NotApplicable => ToolOutcome::Indeterminate,
             OutcomeAssociation::Tool(outcome) => outcome,
         };
-        let result = ResultEvidence {
-            source: observation.source().clone(),
-            outcome,
-        };
+        let source = observation.source().clone();
         match self.calls.remove(&call_id) {
             None => {
-                self.calls
-                    .insert(call_id, PartialCall::OrphanedResult(result));
+                self.calls.insert(
+                    call_id,
+                    PartialCall::OrphanedResult(ResultEvidence::new(source, outcome)),
+                );
                 Ok(())
             }
             Some(PartialCall::Pending(request) | PartialCall::Interrupted(request)) => {
-                self.calls
-                    .insert(call_id, PartialCall::Completed { request, result });
+                self.calls.insert(
+                    call_id,
+                    PartialCall::Completed {
+                        request,
+                        result: ResultEvidence::new(source, outcome),
+                    },
+                );
                 Ok(())
             }
-            Some(existing) => {
-                self.calls.insert(call_id, existing);
-                Err(CorrelationError::DuplicateResult)
+            Some(PartialCall::Completed {
+                request,
+                mut result,
+            }) => {
+                let merged = result.merge(source, outcome);
+                self.calls
+                    .insert(call_id, PartialCall::Completed { request, result });
+                merged
+            }
+            Some(PartialCall::OrphanedResult(mut result)) => {
+                let merged = result.merge(source, outcome);
+                self.calls
+                    .insert(call_id, PartialCall::OrphanedResult(result));
+                merged
             }
         }
     }
@@ -185,6 +229,19 @@ impl CorrelationEngine {
             {
                 *state = PartialCall::Interrupted(request.clone());
             }
+        }
+    }
+}
+
+fn merge_outcomes(
+    existing: ToolOutcome,
+    incoming: ToolOutcome,
+) -> Result<ToolOutcome, CorrelationError> {
+    match (existing, incoming) {
+        (left, right) if left == right => Ok(left),
+        (ToolOutcome::Indeterminate, known) | (known, ToolOutcome::Indeterminate) => Ok(known),
+        (existing, incoming) => {
+            Err(CorrelationError::ConflictingResultOutcomes { existing, incoming })
         }
     }
 }
@@ -275,7 +332,7 @@ fn finalize_call(
             CorrelatedPurpose::Unknown,
             CorrelatedInvocation::Unknown,
             CorrelatedOutcome::Known(result.outcome),
-            EvidenceRefs::new([result.source])?,
+            ordered_evidence(result.sources)?,
         )),
         PartialCall::Completed { request, result } => Ok(CorrelatedToolCall::new(
             call_id.clone(),
@@ -284,21 +341,31 @@ fn finalize_call(
             request.purpose,
             request.invocation,
             CorrelatedOutcome::Known(result.outcome),
-            EvidenceRefs::new([request.source, result.source])?,
+            ordered_evidence(
+                std::iter::once(request.source)
+                    .chain(result.sources)
+                    .collect(),
+            )?,
         )),
     }
+}
+
+fn ordered_evidence(mut sources: Vec<SourceRecordRef>) -> Result<EvidenceRefs, DomainError> {
+    sources.sort_by_key(|source| source.sequence().value());
+    sources.dedup();
+    EvidenceRefs::new(sources)
 }
 
 #[cfg(test)]
 mod tests {
     use harness_graph_domain::{
-        CallAssociation, ContextAssociation, InvocationAssociation, NativeCallId, Observation,
-        ObservationKind, OccurredAt, OutcomeAssociation, PayloadDigest, RecordSequence, SessionId,
-        SourceDigest, SourceRecordRef, ToolAssociation, ToolCallLifecycle, ToolName, ToolOutcome,
-        ToolPurpose, TurnAssociation, TurnId,
+        CallAssociation, ContextAssociation, CorrelatedOutcome, InvocationAssociation,
+        NativeCallId, Observation, ObservationKind, OccurredAt, OutcomeAssociation, PayloadDigest,
+        RecordSequence, SessionId, SourceDigest, SourceRecordRef, ToolAssociation,
+        ToolCallLifecycle, ToolName, ToolOutcome, ToolPurpose, TurnAssociation, TurnId,
     };
 
-    use super::{CorrelationEngine, validate_lifecycle_transition};
+    use super::{CorrelationEngine, CorrelationError, validate_lifecycle_transition};
 
     #[test]
     fn completed_call_cannot_regress_to_pending() -> Result<(), Box<dyn std::error::Error>> {
@@ -352,6 +419,142 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mirrored_results_merge_without_discarding_evidence() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let call_id = NativeCallId::new("mirrored-call")?;
+        let mut engine = CorrelationEngine::default();
+
+        engine.observe(&request(0, call_id.clone(), TurnId::new("mirrored-turn")?)?)?;
+        engine.observe(&result_with_outcome(
+            1,
+            call_id.clone(),
+            ObservationKind::CommandCompleted,
+            ToolOutcome::Succeeded,
+        )?)?;
+        engine.observe(&result_with_outcome(
+            2,
+            call_id,
+            ObservationKind::ToolCompleted,
+            ToolOutcome::Indeterminate,
+        )?)?;
+
+        let correlations = engine.finish()?;
+        let correlation = correlations
+            .iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("expected a completed correlation"))?;
+        assert!(matches!(
+            correlation.lifecycle(),
+            ToolCallLifecycle::Completed { .. }
+        ));
+        assert_eq!(
+            correlation.outcome(),
+            CorrelatedOutcome::Known(ToolOutcome::Succeeded)
+        );
+        assert_eq!(
+            correlation
+                .evidence()
+                .iter()
+                .map(|source| source.sequence().value())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn result_accumulation_is_ordered_associative_and_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let call_id = NativeCallId::new("associative-call")?;
+        let request = request(10, call_id.clone(), TurnId::new("associative-turn")?)?;
+        let early_result = result_with_outcome(
+            20,
+            call_id.clone(),
+            ObservationKind::ToolCompleted,
+            ToolOutcome::Succeeded,
+        )?;
+        let late_result = result_with_outcome(
+            30,
+            call_id,
+            ObservationKind::CommandCompleted,
+            ToolOutcome::Indeterminate,
+        )?;
+
+        let mut orphan_first = CorrelationEngine::default();
+        orphan_first.observe(&late_result)?;
+        orphan_first.observe(&early_result)?;
+        orphan_first.observe(&early_result)?;
+        orphan_first.observe(&request)?;
+
+        let mut request_first = CorrelationEngine::default();
+        request_first.observe(&request)?;
+        request_first.observe(&early_result)?;
+        request_first.observe(&late_result)?;
+
+        let orphan_first = orphan_first.finish()?;
+        let request_first = request_first.finish()?;
+        assert_eq!(orphan_first, request_first);
+        let correlation = orphan_first
+            .iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("expected an accumulated correlation"))?;
+        assert_eq!(correlation.evidence().count().value(), 3);
+        assert_eq!(
+            correlation
+                .evidence()
+                .iter()
+                .map(|source| source.sequence().value())
+                .collect::<Vec<_>>(),
+            vec![11, 21, 31]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn success_and_failure_results_remain_a_typed_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let call_id = NativeCallId::new("conflicting-call")?;
+        let mut engine = CorrelationEngine::default();
+        engine.observe(&request(
+            0,
+            call_id.clone(),
+            TurnId::new("conflicting-turn")?,
+        )?)?;
+        engine.observe(&result_with_outcome(
+            1,
+            call_id.clone(),
+            ObservationKind::CommandCompleted,
+            ToolOutcome::Succeeded,
+        )?)?;
+
+        let conflict = engine.observe(&result_with_outcome(
+            2,
+            call_id,
+            ObservationKind::ToolCompleted,
+            ToolOutcome::Failed,
+        )?);
+        assert!(matches!(
+            conflict,
+            Err(CorrelationError::ConflictingResultOutcomes {
+                existing: ToolOutcome::Succeeded,
+                incoming: ToolOutcome::Failed,
+            })
+        ));
+
+        let correlations = engine.finish()?;
+        let correlation = correlations
+            .iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("expected the valid result to remain"))?;
+        assert_eq!(
+            correlation.outcome(),
+            CorrelatedOutcome::Known(ToolOutcome::Succeeded)
+        );
+        assert_eq!(correlation.evidence().count().value(), 2);
+        Ok(())
+    }
+
     fn request(
         offset: u64,
         call_id: NativeCallId,
@@ -375,14 +578,28 @@ mod tests {
         offset: u64,
         call_id: NativeCallId,
     ) -> Result<Observation, Box<dyn std::error::Error>> {
+        result_with_outcome(
+            offset,
+            call_id,
+            ObservationKind::CommandCompleted,
+            ToolOutcome::Succeeded,
+        )
+    }
+
+    fn result_with_outcome(
+        offset: u64,
+        call_id: NativeCallId,
+        kind: ObservationKind,
+        outcome: ToolOutcome,
+    ) -> Result<Observation, Box<dyn std::error::Error>> {
         observation(
             offset,
-            ObservationKind::CommandCompleted,
+            kind,
             TurnAssociation::SessionScoped,
             CallAssociation::Call(call_id),
             ToolAssociation::NotApplicable,
             InvocationAssociation::NotApplicable,
-            OutcomeAssociation::Tool(ToolOutcome::Succeeded),
+            OutcomeAssociation::Tool(outcome),
         )
     }
 
