@@ -1,6 +1,11 @@
 //! Full-process E2E coverage for the foundation ingestion slice.
 
-use std::{io::Write, path::PathBuf, process::Command};
+use std::{
+    io::Write,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
 
 const SESSION_ID: &str = "019c63db-2995-74c3-b898-c1b92a8e1317";
 
@@ -114,4 +119,100 @@ fn tampered_bundle_fails_before_semantic_parsing() -> Result<(), Box<dyn std::er
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr)?.contains("checksum verification failed"));
     Ok(())
+}
+
+#[tokio::test]
+async fn serve_process_durably_accepts_and_replays_live_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+    let child = command()?
+        .env("HARNESS_GRAPH_BIND_ADDRESS", address.to_string())
+        .env(
+            "HARNESS_GRAPH_JOURNAL_PATH",
+            temporary.path().join("live.jsonl"),
+        )
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut server = ServerProcess::new(child);
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+    wait_until_ready(&client, &base).await?;
+    let event_id = uuid::Uuid::now_v7().to_string();
+    let event = serde_json::json!({
+        "event_id": event_id,
+        "session_id": "ses_cli_e2e",
+        "occurred_at": "2026-07-18T12:00:00Z",
+        "payload": {
+            "type": "activity_observed",
+            "kind": "verify",
+            "status": "succeeded"
+        }
+    });
+
+    let appended = client
+        .post(format!("{base}/v1/live/events"))
+        .json(&event)
+        .send()
+        .await?;
+    assert_eq!(appended.status(), reqwest::StatusCode::CREATED);
+    let replay = client
+        .get(format!("{base}/v1/live/events"))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    assert_eq!(replay["entries"].as_array().map(Vec::len), Some(1));
+    assert_eq!(replay["entries"][0]["event"]["event_id"], event_id);
+
+    server.stop()?;
+    Ok(())
+}
+
+async fn wait_until_ready(
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.get(format!("{base}/health")).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(_) | Err(_) if Instant::now() < deadline => tokio::task::yield_now().await,
+            Ok(response) => {
+                return Err(format!("server health returned {}", response.status()).into());
+            }
+            Err(error) => return Err(format!("server did not become ready: {error}").into()),
+        }
+    }
+}
+
+struct ServerProcess {
+    child: Option<Child>,
+}
+
+impl ServerProcess {
+    const fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn stop(&mut self) -> Result<(), std::io::Error> {
+        if let Some(mut child) = self.child.take() {
+            child.kill()?;
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }

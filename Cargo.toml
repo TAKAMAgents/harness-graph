@@ -10,6 +10,8 @@ members = [
     "crates/path-analysis",
     "crates/planning",
     "crates/mistral-adapter",
+    "crates/event-journal",
+    "crates/api",
     "crates/graph-port",
     "crates/neo4j-adapter",
     "crates/cli",
@@ -25,8 +27,10 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
+futures-util = "0.3"
 hex = "0.4"
 neo4rs = "0.8"
 rig = { package = "rig-core", version = "0.40.0" }
@@ -38,7 +42,8 @@ sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"

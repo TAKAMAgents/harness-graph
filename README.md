@@ -35,6 +35,10 @@ configuration.
 outside Mistral-hosted families. The credential has a redacted debug
 representation and is never included in command output.
 
+`HARNESS_GRAPH_JOURNAL_PATH` selects the append-only live event journal and
+defaults to `data/live-events.jsonl`. The `data/` directory and journal remain
+local and Git-ignored.
+
 ## Historical import
 
 Inspect a verified bundle without touching Neo4j:
@@ -108,6 +112,45 @@ cargo run -p harness-graph-cli -- pathfinder \
 Mistral never receives raw Cypher or raw rollout payloads. Candidate session
 and activity citations are rejected unless they belong to the retrieved typed
 precedents.
+
+## Live ingestion and replay
+
+Start the Axum API and server-sent event stream:
+
+```bash
+cargo run -p harness-graph-cli -- serve
+```
+
+The production surface is intentionally small:
+
+```text
+GET  /health
+POST /v1/live/events
+GET  /v1/live/events?after=<sequence>
+GET  /v1/live/events/stream?after=<sequence>
+```
+
+Live adapters submit only source-safe typed events. For example:
+
+```json
+{
+  "event_id": "019d2a40-7324-77a2-832c-f5f9f84473b0",
+  "session_id": "ses_example",
+  "occurred_at": "2026-07-18T12:00:00Z",
+  "payload": {
+    "type": "activity_observed",
+    "kind": "verify",
+    "status": "succeeded"
+  }
+}
+```
+
+An append is acknowledged only after the JSONL record is flushed and
+`sync_data` succeeds. Retrying the same event ID and content is an identity
+operation; reusing an event ID with different content is rejected. Startup
+replay verifies contiguous sequences, typed JSON, content digests, duplicate
+IDs, and the final newline so torn writes fail closed. SSE first replays the
+durable suffix and then follows new entries.
 
 ## Development commands
 

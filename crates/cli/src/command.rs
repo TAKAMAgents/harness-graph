@@ -7,6 +7,7 @@ use harness_graph_correlation::CorrelationEngine;
 use harness_graph_domain::{
     AnalysisReport, DecodedNativeRecord, RecordCount, SessionId, ToolCallLifecycle,
 };
+use harness_graph_event_journal::AppendOnlyJournal;
 use harness_graph_graph_port::{
     AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector,
     SourceSnapshotCommand,
@@ -48,6 +49,7 @@ pub async fn run() -> Result<(), CliError> {
         Command::Summarize { session_id } => summarize(&config, &session_id).await,
         Command::Pathfinder { task, precedents } => pathfinder(&config, task, precedents).await,
         Command::Import { session_id } => import(&config, &session_id).await,
+        Command::Serve => serve(&config).await,
     }
 }
 
@@ -116,6 +118,8 @@ enum Command {
         #[arg(long)]
         session_id: String,
     },
+    /// Serve durable live ingestion, replay, and server-sent events.
+    Serve,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -154,6 +158,7 @@ fn doctor(config: &AppConfig) -> Result<(), CliError> {
     let _archive = config.archive_root();
     let _neo4j = config.neo4j();
     let _mistral_credential = config.mistral_credential();
+    let _journal_path = config.journal_path();
     write_json(&DoctorOutput {
         status: "ready",
         archive: "configured",
@@ -164,6 +169,17 @@ fn doctor(config: &AppConfig) -> Result<(), CliError> {
             mistral: "configured",
         },
     })
+}
+
+async fn serve(config: &AppConfig) -> Result<(), CliError> {
+    let journal = AppendOnlyJournal::open(config.journal_path())?;
+    let listener = tokio::net::TcpListener::bind(config.bind_address())
+        .await
+        .map_err(|source| CliError::Server { source })?;
+    tracing::info!(address = %config.bind_address(), "live API listening");
+    axum::serve(listener, harness_graph_api::router(journal))
+        .await
+        .map_err(|source| CliError::Server { source })
 }
 
 #[derive(Serialize)]

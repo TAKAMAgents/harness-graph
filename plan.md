@@ -1627,6 +1627,15 @@ new typed activities appear while OpenCode works
 replay of the live journal reconstructs the same logical graph
 ```
 
+Implemented journal/API evidence (2026-07-18): a typed JSONL journal assigns
+contiguous durable sequences, hashes every event, calls `sync_data` before
+acknowledgement, treats exact event retries as identity morphisms, rejects
+identity conflicts, and fails closed on torn or corrupt replay. The Axum API
+provides bounded POST ingestion, cursor replay, and SSE. Focused tests use real
+temporary files, and both router-level and spawned-CLI E2E tests use real TCP
+sockets. OpenCode hook packaging and graph projection remain pending in this
+phase.
+
 ## Phase 9: Pi and Vibe adapters
 
 Only after the shared domain works.
@@ -1749,7 +1758,7 @@ OpenCode begins working and the graph grows live.
 [x] Metadata and checksums are validated before parsing.
 [x] Canonical raw rollouts stream without whole-session buffering.
 [x] Historical raw data is referenced, not copied into this repository.
-[ ] Live events are stored in an append-only journal.
+[x] Live events are stored in an append-only journal.
 [x] Known native record families parse into typed variants.
 [x] Unknown native variants are quarantined, counted, and source-referenced.
 [x] Active/archived relocation does not duplicate a session.

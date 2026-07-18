@@ -3,6 +3,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use harness_graph_domain::GraphNamespace;
+use harness_graph_event_journal::JournalPath;
 use harness_graph_graph_port::BatchSize;
 use harness_graph_ingestion::ArchiveRoot;
 use harness_graph_mistral_adapter::{MistralCredential, MistralModelName};
@@ -19,6 +20,7 @@ pub struct AppConfig {
     graph_batch_size: BatchSize,
     mistral_credential: MistralCredential,
     mistral_model: MistralModelName,
+    journal_path: JournalPath,
     bind_address: SocketAddr,
 }
 
@@ -58,6 +60,10 @@ impl AppConfig {
             required_setting(&file_values, "MISTRAL_API_KEY", &["MISTARL_API_KEY"])?;
         let mistral_model = optional_setting(&file_values, "MISTRAL_MODEL")
             .unwrap_or_else(|| "mistral-small-latest".to_owned());
+        let journal_path = JournalPath::new(PathBuf::from(
+            optional_setting(&file_values, "HARNESS_GRAPH_JOURNAL_PATH")
+                .unwrap_or_else(|| "data/live-events.jsonl".to_owned()),
+        ))?;
         let bind_address = optional_setting(&file_values, "HARNESS_GRAPH_BIND_ADDRESS")
             .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
             .parse()
@@ -73,6 +79,7 @@ impl AppConfig {
             graph_batch_size,
             mistral_credential: MistralCredential::new(mistral_api_key)?,
             mistral_model: MistralModelName::new(mistral_model)?,
+            journal_path,
             bind_address,
         })
     }
@@ -113,6 +120,12 @@ impl AppConfig {
         &self.mistral_model
     }
 
+    /// Append-only live journal location.
+    #[must_use]
+    pub const fn journal_path(&self) -> &JournalPath {
+        &self.journal_path
+    }
+
     /// HTTP bind address.
     #[must_use]
     pub const fn bind_address(&self) -> SocketAddr {
@@ -130,6 +143,7 @@ impl std::fmt::Debug for AppConfig {
             .field("graph_batch_size", &self.graph_batch_size)
             .field("mistral_credential", &"[redacted]")
             .field("mistral_model", &self.mistral_model)
+            .field("journal_path", &"[configured]")
             .field("bind_address", &self.bind_address)
             .finish()
     }

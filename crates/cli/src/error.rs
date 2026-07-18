@@ -4,6 +4,7 @@ use harness_graph_assurance::AssuranceError;
 use harness_graph_classification::ClassificationError;
 use harness_graph_correlation::CorrelationError;
 use harness_graph_domain::DomainError;
+use harness_graph_event_journal::JournalError;
 use harness_graph_graph_port::GraphPortError;
 use harness_graph_ingestion::IngestionError;
 use harness_graph_mistral_adapter::MistralAdapterError;
@@ -78,6 +79,18 @@ pub enum CliError {
     /// Neo4j connectivity, schema, or projection failed.
     #[error(transparent)]
     Neo4j(#[from] Neo4jAdapterError),
+
+    /// Append-only live journal validation or durability failed.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+
+    /// HTTP listener or server failed.
+    #[error("live API server failed: {source}")]
+    Server {
+        /// Network listener or server error.
+        #[source]
+        source: std::io::Error,
+    },
 
     /// Structured command output could not be encoded.
     #[error("failed to encode structured command output: {source}")]
