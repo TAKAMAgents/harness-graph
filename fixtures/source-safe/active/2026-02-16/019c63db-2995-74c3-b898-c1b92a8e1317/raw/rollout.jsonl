@@ -1,0 +1,12 @@
+{"timestamp":"2026-02-16T10:00:00Z","type":"session_meta","payload":{"id":"019c63db-2995-74c3-b898-c1b92a8e1317","timestamp":"2026-02-16T10:00:00Z","cwd":"/source-safe/workspace","model_provider":"mistral","cli_version":"fixture","originator":"source-safe-contract","source":"fixture","base_instructions":"[redacted]"}}
+{"timestamp":"2026-02-16T10:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/source-safe/workspace","model":"mistral-small-latest","effort":"high","approval_policy":"never","sandbox_policy":{"type":"workspace-write"},"summary":"first assertion","developer_instructions":"[redacted]","user_instructions":"[redacted]"}}
+{"timestamp":"2026-02-16T10:00:02Z","type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/source-safe/workspace","model":"mistral-small-latest","effort":"high","approval_policy":"never","sandbox_policy":{"type":"workspace-write"},"summary":"repeated assertion","developer_instructions":"[redacted]","user_instructions":"[redacted]"}}
+{"timestamp":"2026-02-16T10:00:03Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":128000,"collaboration_mode_kind":"default"}}
+{"timestamp":"2026-02-16T10:00:04Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"printf source-safe\"}"}}
+{"timestamp":"2026-02-16T10:00:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"source-safe"}}
+{"timestamp":"2026-02-16T10:00:06Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-2","turn_id":"turn-1","status":"completed","success":true,"changes":{},"stdout":"","stderr":""}}
+{"timestamp":"2026-02-16T10:00:07Z","type":"compacted","payload":{"window_id":"window-2","previous_window_id":"window-1","window_number":2,"message":"[redacted]","replacement_history":[]}}
+{"timestamp":"2026-02-16T10:00:08Z","type":"world_state","payload":{"full":true,"state":{"summary":"[redacted]"}}}
+{"timestamp":"2026-02-16T10:00:09Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":{"turn_id":"turn-1"}}}
+{"timestamp":"2026-02-16T10:00:10Z","type":"event_msg","payload":{"type":"future_contract_event","safe":true}}
+{"timestamp":"2026-02-16T10:00:11Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"[redacted]"}}

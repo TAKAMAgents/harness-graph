@@ -1,0 +1,14 @@
+/target/
+.env
+.env.*
+!.env.example
+.idea/
+.DS_Store
+*.log
+*.db
+*.db-shm
+*.db-wal
+/data/
+/exports/
+/fixtures/private/
+/coverage/

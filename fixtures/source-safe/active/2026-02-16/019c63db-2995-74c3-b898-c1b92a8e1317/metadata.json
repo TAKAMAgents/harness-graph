@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "exported_at": "2026-07-18T10:00:00Z",
+  "session_id": "019c63db-2995-74c3-b898-c1b92a8e1317",
+  "session_date": "2026-02-16",
+  "source_kind": "active",
+  "source_path": "[redacted source-safe fixture]",
+  "source_size_bytes": 2391,
+  "source_sha256": "361d22b75ad8c6114cc9d350f3a35a4d8ad7444eb7843189ca49971a0994c40a",
+  "raw_relative_path": "raw/rollout.jsonl",
+  "raw_size_bytes": 2391,
+  "raw_sha256": "361d22b75ad8c6114cc9d350f3a35a4d8ad7444eb7843189ca49971a0994c40a",
+  "source_stable_during_copy": true,
+  "record_count": 12,
+  "parse_error_count": 0
+}
