@@ -89,6 +89,24 @@ pub enum IngestionError {
         actual: RecordCount,
     },
 
+    /// The configured hard per-record byte limit is outside its safe range.
+    #[error("source record byte limit must be between 256 bytes and 64 MiB")]
+    InvalidSourceRecordByteLimit,
+
+    /// A source record exceeded the configured bounded-memory limit.
+    #[error("canonical record {sequence:?} exceeds the configured source-safe byte limit")]
+    SourceRecordTooLarge {
+        /// Source sequence whose contents were rejected.
+        sequence: RecordSequence,
+    },
+
+    /// A canonical source record was not valid UTF-8.
+    #[error("canonical record {sequence:?} is not valid UTF-8")]
+    InvalidUtf8Record {
+        /// Source sequence whose bytes were rejected.
+        sequence: RecordSequence,
+    },
+
     /// A session or digest domain value failed validation.
     #[error(transparent)]
     Domain(#[from] DomainError),
