@@ -194,6 +194,54 @@ fn repository_canonical_mistral_key_wins_over_inherited_and_cwd_values_end_to_en
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires the real Neo4j credentials from the repository .env"]
+async fn repository_neo4j_credentials_win_over_unrelated_inherited_values_end_to_end()
+-> Result<(), Box<dyn std::error::Error>> {
+    let environment = RepositoryEnvironment::load()?;
+    let temporary = tempfile::tempdir()?;
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+    let child = environment
+        .command(&fixture_root()?, "default")
+        .env(
+            "NEO4J_CONNECTION_URL",
+            "neo4j://unrelated-inherited.invalid:7687",
+        )
+        .env("NEO4J_PASSWORD", "unrelated-inherited-password")
+        .env("HARNESS_GRAPH_BIND_ADDRESS", address.to_string())
+        .env(
+            "HARNESS_GRAPH_JOURNAL_PATH",
+            temporary.path().join("neo4j-precedence.jsonl"),
+        )
+        .env("HARNESS_GRAPH_TRANSCRIPT_ENRICHMENT_MODE", "disabled")
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut server = ServerProcess::new(child);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let base = format!("http://{address}");
+    wait_until_ready(&client, &base).await?;
+
+    let response = client
+        .get(format!("{base}/v1/experience/sessions"))
+        .send()
+        .await?;
+    ensure(
+        response.status().is_success(),
+        "repository Neo4j credential was not selected",
+    )?;
+    let body = response.text().await?;
+    assert!(!body.contains("unrelated-inherited"));
+    assert!(!body.contains(&environment.neo4j_password));
+    server.stop()?;
+    Ok(())
+}
+
 #[test]
 fn bulk_import_exposes_bounded_concurrency_contract() -> Result<(), Box<dyn std::error::Error>> {
     let help = command()?.args(["import-all", "--help"]).output()?;

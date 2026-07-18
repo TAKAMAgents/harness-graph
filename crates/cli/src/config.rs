@@ -53,15 +53,25 @@ impl AppConfig {
     ///
     /// Returns an error when any required graph setting is absent or invalid.
     pub fn neo4j(&self) -> Result<Neo4jConnection, CliError> {
-        let neo4j_url = required_setting(
+        let neo4j_url = project_file_preferred_setting(
             &self.values,
             "NEO4J_CONNECTION_URL",
             &["NEO4J_CONECTION_URL"],
+            optional_process_value,
         )?;
-        let neo4j_password =
-            required_setting(&self.values, "NEO4J_PASSWORD", &["NEO4J_INATANSE_PASSWORD"])?;
-        let neo4j_username =
-            optional_setting(&self.values, "NEO4J_USERNAME").unwrap_or_else(|| "neo4j".to_owned());
+        let neo4j_password = project_file_preferred_setting(
+            &self.values,
+            "NEO4J_PASSWORD",
+            &["NEO4J_INATANSE_PASSWORD"],
+            optional_process_value,
+        )?;
+        let neo4j_username = project_file_preferred_value(
+            &self.values,
+            "NEO4J_USERNAME",
+            &[],
+            optional_process_value,
+        )
+        .unwrap_or_else(|| "neo4j".to_owned());
         Neo4jConnection::new(&neo4j_url, &neo4j_username, neo4j_password)
     }
 
@@ -495,6 +505,37 @@ where
         })
 }
 
+fn project_file_preferred_setting<F>(
+    file: &ConfigurationFile,
+    canonical: &'static str,
+    aliases: &[&str],
+    process_value: F,
+) -> Result<String, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    project_file_preferred_value(file, canonical, aliases, process_value).ok_or(
+        CliError::MissingConfiguration {
+            canonical_name: canonical,
+        },
+    )
+}
+
+fn project_file_preferred_value<F>(
+    file: &ConfigurationFile,
+    canonical: &str,
+    aliases: &[&str],
+    process_value: F,
+) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    file.value(canonical)
+        .or_else(|| aliases.iter().find_map(|alias| file.value(alias)))
+        .or_else(|| process_value(canonical))
+        .or_else(|| aliases.iter().find_map(|alias| process_value(alias)))
+}
+
 fn validate_dedicated_pseudonymization_key<F>(
     file: &ConfigurationFile,
     key: &str,
@@ -694,6 +735,43 @@ mod tests {
         )?;
 
         assert_eq!(selected, "repository-canonical-canary");
+        Ok(())
+    }
+
+    #[test]
+    fn repository_neo4j_configuration_precedes_unrelated_inherited_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let values = ConfigurationFile(vec![
+            (
+                "NEO4J_CONECTION_URL".to_owned(),
+                "neo4j://repository.example:7687".to_owned(),
+            ),
+            (
+                "NEO4J_INATANSE_PASSWORD".to_owned(),
+                "repository-password-canary".to_owned(),
+            ),
+        ]);
+        let process_value = |name: &str| match name {
+            "NEO4J_CONNECTION_URL" => Some("neo4j://unrelated.example:7687".to_owned()),
+            "NEO4J_PASSWORD" => Some("unrelated-password-canary".to_owned()),
+            _ => None,
+        };
+
+        let selected_url = project_file_preferred_setting(
+            &values,
+            "NEO4J_CONNECTION_URL",
+            &["NEO4J_CONECTION_URL"],
+            process_value,
+        )?;
+        let selected_password = project_file_preferred_setting(
+            &values,
+            "NEO4J_PASSWORD",
+            &["NEO4J_INATANSE_PASSWORD"],
+            process_value,
+        )?;
+
+        assert_eq!(selected_url, "neo4j://repository.example:7687");
+        assert_eq!(selected_password, "repository-password-canary");
         Ok(())
     }
 
