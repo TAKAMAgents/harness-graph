@@ -6,7 +6,7 @@ use harness_graph_domain::GraphNamespace;
 use harness_graph_event_journal::JournalPath;
 use harness_graph_graph_port::BatchSize;
 use harness_graph_ingestion::ArchiveRoot;
-use harness_graph_mistral_adapter::{MistralCredential, MistralModelName};
+use harness_graph_mistral_adapter::{MistralConcurrencyLimit, MistralCredential, MistralModelName};
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
@@ -20,6 +20,7 @@ pub struct AppConfig {
     graph_batch_size: BatchSize,
     mistral_credential: MistralCredential,
     mistral_model: MistralModelName,
+    mistral_concurrency: MistralConcurrencyLimit,
     journal_path: JournalPath,
     bind_address: SocketAddr,
 }
@@ -60,6 +61,14 @@ impl AppConfig {
             required_setting(&file_values, "MISTRAL_API_KEY", &["MISTARL_API_KEY"])?;
         let mistral_model = optional_setting(&file_values, "MISTRAL_MODEL")
             .unwrap_or_else(|| "mistral-small-latest".to_owned());
+        let mistral_concurrency = optional_setting(&file_values, "MISTRAL_MAX_CONCURRENCY")
+            .unwrap_or_else(|| "2".to_owned())
+            .parse::<usize>()
+            .map_err(|_| CliError::InvalidConfiguration {
+                canonical_name: "MISTRAL_MAX_CONCURRENCY",
+                reason: "expected an integer between 1 and 4",
+            })
+            .and_then(|value| MistralConcurrencyLimit::new(value).map_err(CliError::from))?;
         let journal_path = JournalPath::new(PathBuf::from(
             optional_setting(&file_values, "HARNESS_GRAPH_JOURNAL_PATH")
                 .unwrap_or_else(|| "data/live-events.jsonl".to_owned()),
@@ -79,6 +88,7 @@ impl AppConfig {
             graph_batch_size,
             mistral_credential: MistralCredential::new(mistral_api_key)?,
             mistral_model: MistralModelName::new(mistral_model)?,
+            mistral_concurrency,
             journal_path,
             bind_address,
         })
@@ -120,6 +130,12 @@ impl AppConfig {
         &self.mistral_model
     }
 
+    /// Maximum simultaneous Mistral API calls in this process.
+    #[must_use]
+    pub const fn mistral_concurrency(&self) -> MistralConcurrencyLimit {
+        self.mistral_concurrency
+    }
+
     /// Append-only live journal location.
     #[must_use]
     pub const fn journal_path(&self) -> &JournalPath {
@@ -143,6 +159,7 @@ impl std::fmt::Debug for AppConfig {
             .field("graph_batch_size", &self.graph_batch_size)
             .field("mistral_credential", &"[redacted]")
             .field("mistral_model", &self.mistral_model)
+            .field("mistral_concurrency", &self.mistral_concurrency)
             .field("journal_path", &"[configured]")
             .field("bind_address", &self.bind_address)
             .finish()

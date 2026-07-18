@@ -19,8 +19,9 @@ use harness_graph_mistral_adapter::RigMistralAdapter;
 use harness_graph_neo4j_adapter::Neo4jAdapter;
 use harness_graph_path_analysis::derive_path;
 use harness_graph_planning::{
-    ModelUsage, NarrativeInterpreter, NarrativeOrigin, NarrativeRequest, Pathfinder,
-    PlanningContext, PrecedentLimit, PrecedentReader, TaskBrief,
+    ModelUsage, NarrativeInterpreter, NarrativeOrigin, NarrativeRequest, NarrativeSummary,
+    Pathfinder, PlanningContext, PrecedentLimit, PrecedentReader, TaskBrief,
+    TaskClassificationRequest,
 };
 use harness_graph_risk::RiskEngine;
 use secrecy::SecretString;
@@ -47,6 +48,7 @@ pub async fn run() -> Result<(), CliError> {
         Command::Analyze { session_id } => analyze(&config, &session_id),
         Command::MistralHealth => mistral_health(&config).await,
         Command::Summarize { session_id } => summarize(&config, &session_id).await,
+        Command::Interpret { session_id, task } => interpret(&config, &session_id, task).await,
         Command::Pathfinder { task, precedents } => pathfinder(&config, task, precedents).await,
         Command::Import { session_id } => import(&config, &session_id).await,
         Command::Serve => serve(&config).await,
@@ -102,6 +104,15 @@ enum Command {
         /// Stable session UUID.
         #[arg(long)]
         session_id: String,
+    },
+    /// Classify a task and extract its session narrative concurrently with Mistral.
+    Interpret {
+        /// Stable session UUID whose deterministic activities support extraction.
+        #[arg(long)]
+        session_id: String,
+        /// Source-safe task brief. Do not include secrets or raw payloads.
+        #[arg(long)]
+        task: String,
     },
     /// Retrieve verified Neo4j precedents and ask Mistral for a cited plan.
     Pathfinder {
@@ -414,12 +425,18 @@ struct SummarizeOutput {
     provider: &'static str,
     model: String,
     session_id: String,
+    #[serde(flatten)]
+    narrative: NarrativePayload,
+    usage: ModelUsageOutput,
+}
+
+#[derive(Serialize)]
+struct NarrativePayload {
     deterministic_activities: u64,
     narrative_activity_count: u64,
     mistral_labeled: u64,
     deterministic_fallbacks: u64,
     narrative_activities: Vec<NarrativeActivityOutput>,
-    usage: ModelUsageOutput,
 }
 
 async fn summarize(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
@@ -427,19 +444,33 @@ async fn summarize(config: &AppConfig, session_id: &str) -> Result<(), CliError>
     let deterministic_activities = analyzed.report.activities().count().value();
     let adapter = mistral_adapter(config)?;
     let result = adapter
-        .summarize(NarrativeRequest::new(analyzed.report.activities().clone()))
+        .summarize(NarrativeRequest::new(analyzed.report.activities().clone())?)
         .await?;
-    let narrative_activity_count = result.value().count().value();
+    let narrative = narrative_payload(result.value(), deterministic_activities);
+    write_json(&SummarizeOutput {
+        status: "summarized",
+        provider: "mistral",
+        model: adapter.model().as_str().to_owned(),
+        session_id: analyzed.session_id.to_string(),
+        narrative,
+        usage: result.usage().into(),
+    })
+}
+
+fn narrative_payload(
+    summary: &NarrativeSummary,
+    deterministic_activities: u64,
+) -> NarrativePayload {
+    let narrative_activity_count = summary.count().value();
     let mut mistral_labeled = RecordCount::default();
     let mut deterministic_fallbacks = RecordCount::default();
-    for activity in result.value().iter() {
+    for activity in summary.iter() {
         match activity.origin() {
             NarrativeOrigin::Mistral => mistral_labeled.increment(),
             NarrativeOrigin::DeterministicFallback => deterministic_fallbacks.increment(),
         }
     }
-    let narrative_activities = result
-        .value()
+    let narrative_activities = summary
         .iter()
         .map(|activity| NarrativeActivityOutput {
             title: activity.title().as_str().to_owned(),
@@ -452,17 +483,72 @@ async fn summarize(config: &AppConfig, session_id: &str) -> Result<(), CliError>
                 .collect(),
         })
         .collect();
-    write_json(&SummarizeOutput {
-        status: "summarized",
-        provider: "mistral",
-        model: adapter.model().as_str().to_owned(),
-        session_id: analyzed.session_id.to_string(),
+    NarrativePayload {
         deterministic_activities,
         narrative_activity_count,
         mistral_labeled: mistral_labeled.value(),
         deterministic_fallbacks: deterministic_fallbacks.value(),
         narrative_activities,
-        usage: result.usage().into(),
+    }
+}
+
+#[derive(Serialize)]
+struct InterpretationOutput {
+    status: &'static str,
+    provider: &'static str,
+    model: String,
+    execution_mode: &'static str,
+    synchronization: &'static str,
+    max_concurrency: usize,
+    session_id: String,
+    classification: ClassificationOutput,
+    extraction: ExtractionOutput,
+}
+
+#[derive(Serialize)]
+struct ClassificationOutput {
+    category: &'static str,
+    confidence: &'static str,
+    explanation: String,
+    usage: ModelUsageOutput,
+}
+
+#[derive(Serialize)]
+struct ExtractionOutput {
+    #[serde(flatten)]
+    narrative: NarrativePayload,
+    usage: ModelUsageOutput,
+}
+
+async fn interpret(config: &AppConfig, session_id: &str, task: String) -> Result<(), CliError> {
+    let analyzed = analyze_session(config, session_id)?;
+    let deterministic_activities = analyzed.report.activities().count().value();
+    let classification = TaskClassificationRequest::new(TaskBrief::new(task)?);
+    let extraction = NarrativeRequest::new(analyzed.report.activities().clone())?;
+    let adapter = mistral_adapter(config)?;
+    let interpretation = adapter
+        .classify_and_extract(classification, extraction)
+        .await?;
+    let classified = interpretation.classification();
+    let extracted = interpretation.extraction();
+    write_json(&InterpretationOutput {
+        status: "interpreted",
+        provider: "mistral",
+        model: adapter.model().as_str().to_owned(),
+        execution_mode: "concurrent",
+        synchronization: "all_results_settle",
+        max_concurrency: adapter.concurrency().value(),
+        session_id: analyzed.session_id.to_string(),
+        classification: ClassificationOutput {
+            category: classified.value().category().as_str(),
+            confidence: classified.value().confidence().as_str(),
+            explanation: classified.value().explanation().as_str().to_owned(),
+            usage: classified.usage().into(),
+        },
+        extraction: ExtractionOutput {
+            narrative: narrative_payload(extracted.value(), deterministic_activities),
+            usage: extracted.usage().into(),
+        },
     })
 }
 
@@ -526,9 +612,10 @@ async fn pathfinder(config: &AppConfig, task: String, precedents: usize) -> Resu
 }
 
 fn mistral_adapter(config: &AppConfig) -> Result<RigMistralAdapter, CliError> {
-    Ok(RigMistralAdapter::new(
+    Ok(RigMistralAdapter::with_concurrency(
         config.mistral_credential(),
         config.mistral_model().clone(),
+        config.mistral_concurrency(),
     )?)
 }
 

@@ -98,6 +98,135 @@ macro_rules! bounded_text {
 bounded_text!(TaskBrief, "source-safe task brief", 2_000);
 bounded_text!(NarrativeTitle, "narrative title", 120);
 bounded_text!(PlanRationale, "plan rationale", 500);
+bounded_text!(ClassificationExplanation, "classification explanation", 300);
+
+/// Closed task category returned by the ambiguous model boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCategory {
+    /// Diagnose and repair incorrect behavior.
+    BugFix,
+    /// Add user-visible or system behavior.
+    Feature,
+    /// Restructure code while preserving behavior.
+    Refactor,
+    /// Gather evidence or investigate an unknown.
+    Research,
+    /// Operate, deploy, recover, or configure a system.
+    Operations,
+    /// Create or improve documentation.
+    Documentation,
+    /// Add, execute, or repair verification coverage.
+    Testing,
+    /// Inspect, transform, or explain data.
+    DataAnalysis,
+    /// The source-safe brief does not support a narrower category.
+    Other,
+}
+
+impl TaskCategory {
+    /// Stable API representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BugFix => "bug_fix",
+            Self::Feature => "feature",
+            Self::Refactor => "refactor",
+            Self::Research => "research",
+            Self::Operations => "operations",
+            Self::Documentation => "documentation",
+            Self::Testing => "testing",
+            Self::DataAnalysis => "data_analysis",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Coarse, non-numeric confidence that avoids false precision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationConfidence {
+    /// The brief is ambiguous or spans several categories.
+    Low,
+    /// The category is supported but not uniquely determined.
+    Medium,
+    /// The category follows directly from the brief.
+    High,
+}
+
+impl ClassificationConfidence {
+    /// Stable API representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Validated Mistral classification of a source-safe task brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifiedTask {
+    category: TaskCategory,
+    confidence: ClassificationConfidence,
+    explanation: ClassificationExplanation,
+}
+
+impl ClassifiedTask {
+    /// Construct a typed classification.
+    #[must_use]
+    pub const fn new(
+        category: TaskCategory,
+        confidence: ClassificationConfidence,
+        explanation: ClassificationExplanation,
+    ) -> Self {
+        Self {
+            category,
+            confidence,
+            explanation,
+        }
+    }
+
+    /// Closed task category.
+    #[must_use]
+    pub const fn category(&self) -> TaskCategory {
+        self.category
+    }
+
+    /// Coarse model confidence.
+    #[must_use]
+    pub const fn confidence(&self) -> ClassificationConfidence {
+        self.confidence
+    }
+
+    /// Bounded model explanation.
+    #[must_use]
+    pub const fn explanation(&self) -> &ClassificationExplanation {
+        &self.explanation
+    }
+}
+
+/// Source-safe task classification request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskClassificationRequest {
+    task: TaskBrief,
+}
+
+impl TaskClassificationRequest {
+    /// Construct a task classification request.
+    #[must_use]
+    pub const fn new(task: TaskBrief) -> Self {
+        Self { task }
+    }
+
+    /// Validated source-safe brief.
+    #[must_use]
+    pub const fn task(&self) -> &TaskBrief {
+        &self.task
+    }
+}
 
 /// Validated maximum number of precedents returned by a graph query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,9 +589,18 @@ pub struct NarrativeRequest {
 
 impl NarrativeRequest {
     /// Construct a narrative request without raw payload data.
-    #[must_use]
-    pub const fn new(activities: SemanticActivities) -> Self {
-        Self { activities }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no deterministic activity is available to cite.
+    pub fn new(activities: SemanticActivities) -> Result<Self, PlanningError> {
+        if activities.count().value() == 0 {
+            Err(PlanningError::EmptyCollection {
+                field: "deterministic activities",
+            })
+        } else {
+            Ok(Self { activities })
+        }
     }
 
     /// Deterministic evidence layer.
@@ -633,7 +771,7 @@ pub struct PlanningContext {
     task: TaskBrief,
 }
 
-/// Provider-reported usage for one model operation, including retries.
+/// Provider-reported usage for one successfully completed model operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsage {
     input: TokenCount,
@@ -676,6 +814,39 @@ impl ModelUsage {
 pub struct ModelResult<T> {
     value: T,
     usage: ModelUsage,
+}
+
+/// Atomic synchronization point for independent classification and extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynchronizedInterpretation {
+    classification: ModelResult<ClassifiedTask>,
+    extraction: ModelResult<NarrativeSummary>,
+}
+
+impl SynchronizedInterpretation {
+    /// Join two independently validated Mistral results.
+    #[must_use]
+    pub const fn new(
+        classification: ModelResult<ClassifiedTask>,
+        extraction: ModelResult<NarrativeSummary>,
+    ) -> Self {
+        Self {
+            classification,
+            extraction,
+        }
+    }
+
+    /// Validated task classification and its usage.
+    #[must_use]
+    pub const fn classification(&self) -> &ModelResult<ClassifiedTask> {
+        &self.classification
+    }
+
+    /// Citation-complete narrative extraction and its usage.
+    #[must_use]
+    pub const fn extraction(&self) -> &ModelResult<NarrativeSummary> {
+        &self.extraction
+    }
 }
 
 impl<T> ModelResult<T> {
@@ -739,6 +910,19 @@ pub trait NarrativeInterpreter: Send + Sync {
     ) -> Result<ModelResult<NarrativeSummary>, Self::Error>;
 }
 
+/// Provider-agnostic classifier for an ambiguous source-safe task brief.
+#[async_trait]
+pub trait TaskClassifier: Send + Sync {
+    /// Concrete model adapter error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Classify a source-safe brief into a closed category.
+    async fn classify(
+        &self,
+        request: TaskClassificationRequest,
+    ) -> Result<ModelResult<ClassifiedTask>, Self::Error>;
+}
+
 /// Provider-agnostic precedent-backed path planner.
 #[async_trait]
 pub trait Pathfinder: Send + Sync {
@@ -756,13 +940,25 @@ pub trait Pathfinder: Send + Sync {
 #[cfg(test)]
 mod tests {
     use harness_graph_domain::{
-        ActivityId, ActivityKind, ActivityStatus, PathSignature, SessionId, SourceDigest,
+        ActivityId, ActivityKind, ActivityStatus, PathSignature, SemanticActivities, SessionId,
+        SourceDigest,
     };
 
     use super::{
-        ActivityCitations, CandidatePlan, PlanRationale, PlannedStep, PlannedSteps, PlanningError,
-        PrecedentCitations, PrecedentPath, PrecedentPaths, PrecedentStep, PrecedentSteps,
+        ActivityCitations, CandidatePlan, NarrativeRequest, PlanRationale, PlannedStep,
+        PlannedSteps, PlanningError, PrecedentCitations, PrecedentPath, PrecedentPaths,
+        PrecedentStep, PrecedentSteps,
     };
+
+    #[test]
+    fn narrative_request_rejects_an_uncitable_empty_source() {
+        assert!(matches!(
+            NarrativeRequest::new(SemanticActivities::default()),
+            Err(PlanningError::EmptyCollection {
+                field: "deterministic activities"
+            })
+        ));
+    }
 
     #[test]
     fn candidate_plan_rejects_activity_outside_verified_precedents()

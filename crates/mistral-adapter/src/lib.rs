@@ -1,23 +1,57 @@
 //! Rig-backed Mistral adapter for bounded interpretation and planning.
 
 use async_trait::async_trait;
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    future::IntoFuture,
+    sync::Arc,
+    time::Duration,
+};
 
 use harness_graph_domain::{ActivityId, ActivityKind, DomainError, SessionId, TokenCount};
 use harness_graph_planning::{
-    ActivityCitations, CandidatePlan, ModelResult, ModelUsage, NarrativeActivity,
-    NarrativeInterpreter, NarrativeOrigin, NarrativeRequest, NarrativeSummary, NarrativeTitle,
-    Pathfinder, PlanRationale, PlannedStep, PlannedSteps, PlanningContext, PlanningError,
-    PrecedentCitations, PrecedentPaths,
+    ActivityCitations, CandidatePlan, ClassificationConfidence, ClassificationExplanation,
+    ClassifiedTask, ModelResult, ModelUsage, NarrativeActivity, NarrativeInterpreter,
+    NarrativeOrigin, NarrativeRequest, NarrativeSummary, NarrativeTitle, Pathfinder, PlanRationale,
+    PlannedStep, PlannedSteps, PlanningContext, PlanningError, PrecedentCitations, PrecedentPaths,
+    SynchronizedInterpretation, TaskCategory, TaskClassificationRequest, TaskClassifier,
 };
 use rig::{
     client::{CompletionClient, ModelListingClient},
-    extractor::ExtractionError,
+    completion::{StructuredOutputError, TypedPrompt},
     providers::mistral,
 };
 use schemars::JsonSchema;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Semaphore, SemaphorePermit};
+
+const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// One bounded operation at the Mistral provider boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MistralOperation {
+    /// Credential verification through model listing.
+    Health,
+    /// Source-safe task classification.
+    TaskClassification,
+    /// Deterministic activity narrative extraction.
+    NarrativeExtraction,
+    /// Evidence-cited future-path proposal.
+    Pathfinder,
+}
+
+impl std::fmt::Display for MistralOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Health => "health check",
+            Self::TaskClassification => "task classification",
+            Self::NarrativeExtraction => "narrative extraction",
+            Self::Pathfinder => "Pathfinder proposal",
+        })
+    }
+}
 
 /// Mistral adapter construction or invocation failure.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +63,52 @@ pub enum MistralAdapterError {
     /// Model identifier is not recognizably a Mistral-hosted family.
     #[error("Mistral model name must use a supported Mistral family prefix")]
     InvalidModelName,
+
+    /// Configured provider concurrency was outside its safety bound.
+    #[error("Mistral concurrency must be between 1 and 4")]
+    InvalidConcurrency,
+
+    /// The adapter's bounded concurrency gate was closed unexpectedly.
+    #[error("Mistral concurrency gate is closed")]
+    ConcurrencyClosed,
+
+    /// A provider operation exceeded its wall-clock safety bound.
+    #[error("Mistral {operation} exceeded the 90-second request timeout")]
+    RequestTimeout {
+        /// Timed-out provider operation.
+        operation: MistralOperation,
+    },
+
+    /// Classification failed after the parallel extraction still settled.
+    #[error("parallel Mistral classification failed: {source}")]
+    ParallelClassification {
+        /// Classification failure.
+        #[source]
+        source: Box<MistralAdapterError>,
+        /// Provider usage retained from the successful extraction sibling.
+        extraction_usage: ModelUsage,
+    },
+
+    /// Extraction failed after the parallel classification still settled.
+    #[error("parallel Mistral extraction failed: {source}")]
+    ParallelExtraction {
+        /// Extraction failure.
+        #[source]
+        source: Box<MistralAdapterError>,
+        /// Provider usage retained from the successful classification sibling.
+        classification_usage: ModelUsage,
+    },
+
+    /// Both synchronized provider operations failed after settling.
+    #[error(
+        "parallel Mistral classification and extraction both failed; classification: {classification}; extraction: {extraction}"
+    )]
+    ParallelOperations {
+        /// Classification failure.
+        classification: Box<MistralAdapterError>,
+        /// Extraction failure.
+        extraction: Box<MistralAdapterError>,
+    },
 
     /// Rig could not construct the Mistral provider client.
     #[error("failed to construct Rig Mistral client: {source}")]
@@ -54,12 +134,12 @@ pub enum MistralAdapterError {
     #[error("Mistral narrative output returned an out-of-range group identity")]
     InvalidNarrativeGroupIdentity,
 
-    /// Rig's structured extractor failed to obtain valid tool output.
-    #[error("Mistral structured extraction failed: {source}")]
-    Extraction {
-        /// Structured extraction error.
+    /// Rig's native JSON-schema boundary failed.
+    #[error("Mistral structured output failed: {source}")]
+    StructuredOutput {
+        /// Structured-output error.
         #[source]
-        source: ExtractionError,
+        source: StructuredOutputError,
     },
 
     /// Model output failed typed planning validation.
@@ -123,10 +203,40 @@ impl MistralModelName {
     }
 }
 
+/// Validated upper bound for in-flight Mistral API calls from one adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MistralConcurrencyLimit(usize);
+
+impl MistralConcurrencyLimit {
+    /// Default permits classification and extraction to overlap once.
+    pub const DEFAULT: Self = Self(2);
+
+    /// Validate the provider concurrency safety bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside `1..=4`.
+    pub const fn new(value: usize) -> Result<Self, MistralAdapterError> {
+        if value == 0 || value > 4 {
+            Err(MistralAdapterError::InvalidConcurrency)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Maximum in-flight Mistral requests.
+    #[must_use]
+    pub const fn value(self) -> usize {
+        self.0
+    }
+}
+
 /// Concrete Rig client pinned to the Mistral provider.
 pub struct RigMistralAdapter {
     client: mistral::Client,
     model: MistralModelName,
+    concurrency: MistralConcurrencyLimit,
+    permits: Arc<Semaphore>,
 }
 
 impl RigMistralAdapter {
@@ -139,9 +249,27 @@ impl RigMistralAdapter {
         credential: &MistralCredential,
         model: MistralModelName,
     ) -> Result<Self, MistralAdapterError> {
+        Self::with_concurrency(credential, model, MistralConcurrencyLimit::DEFAULT)
+    }
+
+    /// Construct a Mistral-only adapter with bounded request concurrency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Rig cannot initialize its Mistral client.
+    pub fn with_concurrency(
+        credential: &MistralCredential,
+        model: MistralModelName,
+        concurrency: MistralConcurrencyLimit,
+    ) -> Result<Self, MistralAdapterError> {
         let client = mistral::Client::new(credential.0.expose_secret())
             .map_err(|source| MistralAdapterError::Client { source })?;
-        Ok(Self { client, model })
+        Ok(Self {
+            client,
+            model,
+            concurrency,
+            permits: Arc::new(Semaphore::new(concurrency.value())),
+        })
     }
 
     /// Verify the credential against Mistral's real model endpoint.
@@ -150,10 +278,12 @@ impl RigMistralAdapter {
     ///
     /// Returns an error for provider authentication or transport failures.
     pub async fn health(&self) -> Result<(), MistralAdapterError> {
-        let models = self
-            .client
-            .list_models()
+        let _permit = self.acquire_permit().await?;
+        let models = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, self.client.list_models())
             .await
+            .map_err(|_| MistralAdapterError::RequestTimeout {
+                operation: MistralOperation::Health,
+            })?
             .map_err(|source| MistralAdapterError::Health { source })?;
         if models.is_empty() {
             Err(MistralAdapterError::EmptyModelCatalog)
@@ -167,6 +297,56 @@ impl RigMistralAdapter {
     pub const fn model(&self) -> &MistralModelName {
         &self.model
     }
+
+    /// Configured maximum in-flight provider calls.
+    #[must_use]
+    pub const fn concurrency(&self) -> MistralConcurrencyLimit {
+        self.concurrency
+    }
+
+    /// Start classification and narrative extraction concurrently, then join
+    /// only their independently validated results.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first classification, extraction, provider, or validation
+    /// failure and emits no partial synchronized result.
+    pub async fn classify_and_extract(
+        &self,
+        classification: TaskClassificationRequest,
+        extraction: NarrativeRequest,
+    ) -> Result<SynchronizedInterpretation, MistralAdapterError> {
+        let (classification, extraction) = tokio::join!(
+            TaskClassifier::classify(self, classification),
+            NarrativeInterpreter::summarize(self, extraction),
+        );
+        match (classification, extraction) {
+            (Ok(classification), Ok(extraction)) => {
+                Ok(SynchronizedInterpretation::new(classification, extraction))
+            }
+            (Err(source), Ok(extraction)) => Err(MistralAdapterError::ParallelClassification {
+                source: Box::new(source),
+                extraction_usage: extraction.usage(),
+            }),
+            (Ok(classification), Err(source)) => Err(MistralAdapterError::ParallelExtraction {
+                source: Box::new(source),
+                classification_usage: classification.usage(),
+            }),
+            (Err(classification), Err(extraction)) => {
+                Err(MistralAdapterError::ParallelOperations {
+                    classification: Box::new(classification),
+                    extraction: Box::new(extraction),
+                })
+            }
+        }
+    }
+
+    async fn acquire_permit(&self) -> Result<SemaphorePermit<'_>, MistralAdapterError> {
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| MistralAdapterError::ConcurrencyClosed)
+    }
 }
 
 impl std::fmt::Debug for RigMistralAdapter {
@@ -175,6 +355,7 @@ impl std::fmt::Debug for RigMistralAdapter {
             .debug_struct("RigMistralAdapter")
             .field("provider", &"mistral")
             .field("model", &self.model)
+            .field("concurrency", &self.concurrency)
             .finish_non_exhaustive()
     }
 }
@@ -223,6 +404,62 @@ impl From<ActivityKindDto> for ActivityKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TaskCategoryDto {
+    BugFix,
+    Feature,
+    Refactor,
+    Research,
+    Operations,
+    Documentation,
+    Testing,
+    DataAnalysis,
+    Other,
+}
+
+impl From<TaskCategoryDto> for TaskCategory {
+    fn from(value: TaskCategoryDto) -> Self {
+        match value {
+            TaskCategoryDto::BugFix => Self::BugFix,
+            TaskCategoryDto::Feature => Self::Feature,
+            TaskCategoryDto::Refactor => Self::Refactor,
+            TaskCategoryDto::Research => Self::Research,
+            TaskCategoryDto::Operations => Self::Operations,
+            TaskCategoryDto::Documentation => Self::Documentation,
+            TaskCategoryDto::Testing => Self::Testing,
+            TaskCategoryDto::DataAnalysis => Self::DataAnalysis,
+            TaskCategoryDto::Other => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ClassificationConfidenceDto {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<ClassificationConfidenceDto> for ClassificationConfidence {
+    fn from(value: ClassificationConfidenceDto) -> Self {
+        match value {
+            ClassificationConfidenceDto::Low => Self::Low,
+            ClassificationConfidenceDto::Medium => Self::Medium,
+            ClassificationConfidenceDto::High => Self::High,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TaskClassificationDto {
+    category: TaskCategoryDto,
+    confidence: ClassificationConfidenceDto,
+    explanation: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NarrativeActivityDto {
@@ -248,8 +485,58 @@ struct PlannedStepDto {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CandidatePlanDto {
-    cited_session_ids: Vec<String>,
+    /// UUID values copied only from supplied `precedent_session_uuid` fields.
+    cited_session_ids: Vec<uuid::Uuid>,
+    /// Ordered, evidence-cited future activities.
     steps: Vec<PlannedStepDto>,
+}
+
+#[async_trait]
+impl TaskClassifier for RigMistralAdapter {
+    type Error = MistralAdapterError;
+
+    #[tracing::instrument(
+        name = "mistral.task_classification",
+        skip_all,
+        fields(provider = "mistral", model = %self.model.as_str())
+    )]
+    async fn classify(
+        &self,
+        request: TaskClassificationRequest,
+    ) -> Result<ModelResult<ClassifiedTask>, Self::Error> {
+        let _permit = self.acquire_permit().await?;
+        let agent = self
+            .client
+            .agent(self.model.as_str())
+            .preamble(
+                "Classify the source-safe engineering task into exactly one supplied category. \
+                 Use other only when no narrower category is supported. Confidence is coarse, \
+                 not numeric. Explain the choice without adding facts absent from the brief.",
+            )
+            .temperature(0.0)
+            .additional_params(serde_json::json!({ "random_seed": 0 }))
+            .max_tokens(800)
+            .build();
+        let response = tokio::time::timeout(
+            PROVIDER_REQUEST_TIMEOUT,
+            agent
+                .prompt_typed::<TaskClassificationDto>(request.task().as_str())
+                .max_turns(1)
+                .extended_details()
+                .into_future(),
+        )
+        .await
+        .map_err(|_| MistralAdapterError::RequestTimeout {
+            operation: MistralOperation::TaskClassification,
+        })?
+        .map_err(|source| MistralAdapterError::StructuredOutput { source })?;
+        let classified = ClassifiedTask::new(
+            response.output.category.into(),
+            response.output.confidence.into(),
+            ClassificationExplanation::new(response.output.explanation)?,
+        );
+        Ok(ModelResult::new(classified, convert_usage(response.usage)))
+    }
 }
 
 #[async_trait]
@@ -260,26 +547,38 @@ impl NarrativeInterpreter for RigMistralAdapter {
         &self,
         request: NarrativeRequest,
     ) -> Result<ModelResult<NarrativeSummary>, Self::Error> {
-        let target = request.activities().iter().count().div_ceil(3).clamp(1, 25);
+        let _permit = self.acquire_permit().await?;
+        let source_count = request.activities().iter().count();
+        let target = narrative_target(source_count);
         let groups = partition_narrative_evidence(&request, target);
         let prompt = render_narrative_prompt(&request, target, &groups);
-        let extractor = self
+        let agent = self
             .client
-            .extractor::<NarrativeSummaryDto>(self.model.as_str())
+            .agent(self.model.as_str())
             .preamble(&format!(
                 "Return exactly {target} ordered macro-activities, one for each supplied group_index. \
                  Preserve every group_index exactly once and in ascending order. Do not \
                  decide success, risk, or verification. Titles may state only the supplied semantic \
                  kinds and statuses; never invent a target, system, cause, file, or concern."
             ))
+            .temperature(0.0)
+            .additional_params(serde_json::json!({ "random_seed": 0 }))
             .max_tokens(5_000)
-            .retries(1)
             .build();
-        let response = extractor
-            .extract_with_usage(prompt)
-            .await
-            .map_err(|source| MistralAdapterError::Extraction { source })?;
-        let summary = narrative_from_dto(response.data, request.activities(), groups)?;
+        let response = tokio::time::timeout(
+            PROVIDER_REQUEST_TIMEOUT,
+            agent
+                .prompt_typed::<NarrativeSummaryDto>(prompt)
+                .max_turns(1)
+                .extended_details()
+                .into_future(),
+        )
+        .await
+        .map_err(|_| MistralAdapterError::RequestTimeout {
+            operation: MistralOperation::NarrativeExtraction,
+        })?
+        .map_err(|source| MistralAdapterError::StructuredOutput { source })?;
+        let summary = narrative_from_dto(response.output, request.activities(), groups)?;
         Ok(ModelResult::new(summary, convert_usage(response.usage)))
     }
 }
@@ -293,23 +592,44 @@ impl Pathfinder for RigMistralAdapter {
         context: PlanningContext,
         precedents: PrecedentPaths,
     ) -> Result<ModelResult<CandidatePlan>, Self::Error> {
+        let _permit = self.acquire_permit().await?;
         let prompt = render_pathfinder_prompt(&context, &precedents);
-        let extractor = self
+        let agent = self
             .client
-            .extractor::<CandidatePlanDto>(self.model.as_str())
+            .agent(self.model.as_str())
             .preamble(
                 "Propose 3 to 10 ordered activities. Cite only supplied activity and session IDs. \
+                 cited_session_ids must contain only UUID values copied verbatim from the supplied \
+                 precedent_session_uuid fields. Never put an activity ID or path hash in that field. \
                  Prefer verified steps, include final verification, and never invent graph evidence.",
             )
+            .temperature(0.0)
+            .additional_params(serde_json::json!({ "random_seed": 0 }))
             .max_tokens(3_000)
-            .retries(1)
             .build();
-        let response = extractor
-            .extract_with_usage(prompt)
-            .await
-            .map_err(|source| MistralAdapterError::Extraction { source })?;
-        let candidate = candidate_from_dto(response.data, &precedents)?;
+        let response = tokio::time::timeout(
+            PROVIDER_REQUEST_TIMEOUT,
+            agent
+                .prompt_typed::<CandidatePlanDto>(prompt)
+                .max_turns(1)
+                .extended_details()
+                .into_future(),
+        )
+        .await
+        .map_err(|_| MistralAdapterError::RequestTimeout {
+            operation: MistralOperation::Pathfinder,
+        })?
+        .map_err(|source| MistralAdapterError::StructuredOutput { source })?;
+        let candidate = candidate_from_dto(response.output, &precedents)?;
         Ok(ModelResult::new(candidate, convert_usage(response.usage)))
+    }
+}
+
+fn narrative_target(source_count: usize) -> usize {
+    if source_count >= 15 {
+        source_count.div_ceil(3).clamp(15, 25)
+    } else {
+        source_count.div_ceil(3).clamp(1, 25)
     }
 }
 
@@ -359,10 +679,8 @@ fn render_narrative_prompt(
 fn render_pathfinder_prompt(context: &PlanningContext, precedents: &PrecedentPaths) -> String {
     let mut prompt = format!("Task: {}\nVerified precedents:\n", context.task().as_str());
     for precedent in precedents.iter() {
-        prompt.push_str("session=");
+        prompt.push_str("precedent_session_uuid=");
         prompt.push_str(&precedent.session_id().to_string());
-        prompt.push_str(" path=");
-        prompt.push_str(&precedent.path_signature().to_hex());
         prompt.push('\n');
         for step in precedent.steps().iter() {
             prompt.push_str(&step.activity_id().to_hex());
@@ -382,12 +700,18 @@ fn narrative_from_dto(
     groups: Vec<Vec<ActivityId>>,
 ) -> Result<NarrativeSummary, MistralAdapterError> {
     let mut labels = BTreeMap::new();
+    let mut duplicates = BTreeSet::new();
     for activity in dto.activities {
         let index = usize::from(activity.group_index);
         if index == 0 || index > groups.len() {
             return Err(MistralAdapterError::InvalidNarrativeGroupIdentity);
         }
-        labels.entry(index).or_insert(activity);
+        if labels.insert(index, activity).is_some() {
+            duplicates.insert(index);
+        }
+    }
+    for duplicate in duplicates {
+        labels.remove(&duplicate);
     }
     let activities = groups
         .into_iter()
@@ -401,9 +725,13 @@ fn narrative_from_dto(
                     NarrativeOrigin::Mistral,
                 )
             } else {
+                let first_citation = citations
+                    .first()
+                    .copied()
+                    .ok_or(MistralAdapterError::InvalidNarrativeGroupIdentity)?;
                 let kind = source
                     .iter()
-                    .find(|activity| activity.id() == citations[0])
+                    .find(|activity| activity.id() == first_citation)
                     .map(harness_graph_domain::SemanticActivity::kind)
                     .ok_or(MistralAdapterError::InvalidNarrativeGroupIdentity)?;
                 (
@@ -430,7 +758,7 @@ fn candidate_from_dto(
     let sessions = dto
         .cited_session_ids
         .into_iter()
-        .map(|value| SessionId::parse(&value))
+        .map(|value| SessionId::parse(&value.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let steps = dto
         .steps
@@ -467,7 +795,10 @@ const fn convert_usage(usage: rig::completion::Usage) -> ModelUsage {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{MistralAdapterError, MistralCredential, MistralModelName, RigMistralAdapter};
+    use super::{
+        MistralAdapterError, MistralConcurrencyLimit, MistralCredential, MistralModelName,
+        RigMistralAdapter, narrative_target,
+    };
 
     #[test]
     fn model_boundary_accepts_only_mistral_hosted_families() {
@@ -485,6 +816,37 @@ mod tests {
         let debug = format!("{credential:?}");
         assert_eq!(debug, "MistralCredential([redacted])");
         Ok(())
+    }
+
+    #[test]
+    fn concurrency_boundary_accepts_only_the_provider_safety_range() {
+        assert_eq!(MistralConcurrencyLimit::DEFAULT.value(), 2);
+        assert!(MistralConcurrencyLimit::new(1).is_ok());
+        assert!(MistralConcurrencyLimit::new(4).is_ok());
+        assert!(matches!(
+            MistralConcurrencyLimit::new(0),
+            Err(MistralAdapterError::InvalidConcurrency)
+        ));
+        assert!(matches!(
+            MistralConcurrencyLimit::new(5),
+            Err(MistralAdapterError::InvalidConcurrency)
+        ));
+    }
+
+    #[test]
+    fn narrative_target_preserves_the_large_source_floor_and_bound() {
+        assert_eq!(narrative_target(1), 1);
+        assert_eq!(narrative_target(14), 5);
+        assert_eq!(narrative_target(15), 15);
+        assert_eq!(narrative_target(42), 15);
+        assert_eq!(narrative_target(50), 17);
+        assert_eq!(narrative_target(100), 25);
+    }
+
+    #[test]
+    fn shared_adapter_is_safe_for_concurrent_async_branches() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RigMistralAdapter>();
     }
 
     #[tokio::test]

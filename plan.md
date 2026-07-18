@@ -901,6 +901,13 @@ Use Mistral through Rig for:
 * semantic similarity explanation;
 * candidate-plan generation.
 
+Implemented task classification consumes only a validated source-safe
+`TaskBrief` and returns a closed `TaskCategory`, coarse semantic confidence,
+and bounded explanation. It does not replace the deterministic activity
+classifier. Unclear command purpose and custom-script intent remain pending
+until the ingestion boundary can produce a source-safe invocation synopsis;
+raw invocation text will not be sent merely to complete those bullets.
+
 Use strict structured output:
 
 ```rust
@@ -961,6 +968,21 @@ Missing model group labels do not remove evidence. They become explicit
 `deterministic_fallback` kind-only labels, while every Mistral-supplied label is
 marked `mistral`. The provider is fixed by the Rig Mistral client and the model
 name is validated as a Mistral-hosted family before construction.
+
+Task classification and narrative extraction now compose as a bounded product:
+
+```text
+TaskClassificationRequest ── Mistral native JSON schema ──┐
+                                                          ├─ synchronized result
+NarrativeRequest ─────────── Mistral native JSON schema ──┘
+```
+
+Both I/O-bound morphisms begin concurrently through `tokio::join!` and share a
+typed semaphore whose default bound is two. The join waits for both cost-bearing
+calls to settle instead of cancelling a sibling on first failure. Each branch
+uses one model turn, deterministic sampling parameters, and a 90-second bound.
+Only two independently validated values form `SynchronizedInterpretation`;
+classification and extraction usage remain separately attributable.
 
 ---
 
@@ -1532,6 +1554,14 @@ produces 56 episodes, then 19 narrative macro-activities covering all 56 unique
 activity IDs exactly once. Model omissions are retained as provenance-marked
 deterministic fallbacks rather than hidden or fabricated labels.
 
+Synchronized-provider evidence (2026-07-18): a real full-process E2E used the
+canonical project `MISTRAL_API_KEY`, classified one source-safe task while
+extracting a verified 50-activity session, returned 17 ordered narrative groups,
+covered all 50 activity citations exactly once, and retained separate nonzero
+classification and extraction usage. The same test verifies the provider/model
+boundary, closed classification enums, explanation bound, and concurrency of
+two without asserting brittle wall-clock speed or exposing raw payloads.
+
 ## Phase 4: risk and assurance
 
 Deliver:
@@ -1771,6 +1801,8 @@ OpenCode begins working and the graph grows live.
 [x] Tool calls and results correlate by native ID.
 [x] Pending, interrupted, and orphaned tool-call states are preserved.
 [x] Low-level events become semantic activities.
+[x] Mistral task classification uses a closed source-safe structured-output boundary.
+[x] Mistral classification and narrative extraction run concurrently and synchronize.
 [x] Neo4j reconstructs the full execution path.
 [x] Neo4j projection uses uniqueness constraints, bounded batches, and checkpoints.
 [ ] The UI shows timeline, graph, context, and assurance.

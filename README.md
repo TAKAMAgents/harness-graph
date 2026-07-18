@@ -34,6 +34,7 @@ configuration.
 `MISTRAL_MODEL` defaults to `mistral-small-latest` and rejects model names
 outside Mistral-hosted families. The credential has a redacted debug
 representation and is never included in command output.
+`MISTRAL_MAX_CONCURRENCY` defaults to `2` and is constrained to `1..=4`.
 
 `HARNESS_GRAPH_JOURNAL_PATH` selects the append-only live event journal and
 defaults to `data/live-events.jsonl`. The `data/` directory and journal remain
@@ -94,11 +95,26 @@ Create a 15–25-item narrative layer over deterministic activities:
 cargo run -p harness-graph-cli -- summarize --session-id <uuid>
 ```
 
+Classify a source-safe task and extract that session's narrative concurrently:
+
+```bash
+cargo run -p harness-graph-cli -- interpret \
+  --session-id <uuid> \
+  --task "Investigate and improve an agent workflow with incomplete verification evidence."
+```
+
+The `interpret` command starts two independent Mistral structured-output calls
+and joins both results with `tokio::join!`. The shared semaphore permits two
+in-flight calls by default, both branches settle even if one fails, and no
+partial synchronized result is emitted. Classification and extraction retain
+separate provider usage. Each call is limited to one model turn and a
+90-second wall-clock request bound.
+
 Rust partitions and owns every activity citation. Mistral supplies bounded
-structured labels only. If Mistral omits a requested group, the adapter retains
-coverage with a deterministic kind-only label and reports its origin as
-`deterministic_fallback`; it never invents missing evidence or silently treats
-the model response as complete.
+native JSON-schema labels only. If Mistral omits or duplicates a requested
+group, the adapter retains coverage with a deterministic kind-only label and
+reports its origin as `deterministic_fallback`; it never invents missing
+evidence or silently treats the model response as complete.
 
 Retrieve verified-success paths through the typed graph port and ask Mistral
 for a citation-validated plan:
@@ -175,6 +191,17 @@ canonical `MISTRAL_API_KEY`:
 ```bash
 cargo test -p harness-graph-mistral-adapter \
   --all-features -- --ignored --nocapture
+```
+
+The real full-process classification-plus-extraction E2E uses the same
+canonical credential and verified local archive:
+
+```bash
+cargo test -p harness-graph-cli --test live_mistral \
+  live_interpret_classifies_and_extracts_concurrently -- --ignored --nocapture
+
+cargo test -p harness-graph-cli --test live_mistral \
+  live_pathfinder_preserves_typed_session_and_activity_citations -- --ignored --nocapture
 ```
 
 Detailed architecture, commands, migration procedures, observability, and
