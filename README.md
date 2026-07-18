@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/harness.png" alt="HarnessGraph logo" width="720">
+</p>
+
 # HarnessGraph
 
 HarnessGraph converts sensitive coding-agent execution exports into a typed,
