@@ -29,7 +29,7 @@ pub struct ModelRequestCount(u64);
 
 impl ModelRequestCount {
     fn from_chunks(chunks: RecordCount) -> Self {
-        Self(chunks.value().saturating_add(1))
+        Self(chunks.value())
     }
 
     fn saturating_add(self, other: Self) -> Self {
@@ -99,7 +99,7 @@ impl TranscriptTokenPricing {
     }
 }
 
-/// Bounded output-token estimate applied to each map and reduction request.
+/// Bounded output-token estimate applied to each chunk extraction request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EstimatedOutputTokensPerRequest(u64);
 
@@ -162,13 +162,13 @@ impl TranscriptSessionEstimate {
         self.chunks
     }
 
-    /// Estimated map plus reduction requests.
+    /// Estimated chunk extraction requests.
     #[must_use]
     pub const fn request_count(&self) -> ModelRequestCount {
         self.requests
     }
 
-    /// Estimated provider input tokens, including semantic reduction input.
+    /// Estimated provider input tokens across chunk extraction requests.
     #[must_use]
     pub const fn estimated_input_tokens(&self) -> EstimatedTokenCount {
         self.estimated_input_tokens
@@ -238,10 +238,7 @@ impl TranscriptInventoryEstimator {
         let output_tokens = EstimatedTokenCount::from_estimate(
             requests.value().saturating_mul(self.output_per_request.0),
         );
-        // The reducer consumes validated map output, never raw transcript text.
-        let input_tokens = EstimatedTokenCount::from_estimate(
-            map_input.value().saturating_add(output_tokens.value()),
-        );
+        let input_tokens = map_input;
         let estimated_cost = cost_for_tokens(input_tokens, self.pricing.input)
             .saturating_add(cost_for_tokens(output_tokens, self.pricing.output));
         TranscriptSessionEstimate {
@@ -403,8 +400,20 @@ fn add_records(left: RecordCount, right: RecordCount) -> RecordCount {
 
 #[cfg(test)]
 mod tests {
-    use super::{MicroUsd, TokenRatePerMillion, cost_for_tokens};
+    use harness_graph_domain::RecordCount;
+
+    use super::{MicroUsd, ModelRequestCount, TokenRatePerMillion, cost_for_tokens};
     use crate::EstimatedTokenCount;
+
+    #[test]
+    fn provider_request_count_equals_chunk_count_at_cardinality_boundaries() {
+        for chunk_count in [0, 1, 2, u64::MAX] {
+            assert_eq!(
+                ModelRequestCount::from_chunks(RecordCount::new(chunk_count)).value(),
+                chunk_count
+            );
+        }
+    }
 
     #[test]
     fn integer_cost_rounds_up_without_floating_point() {

@@ -1184,7 +1184,7 @@ a model inference until a deterministic observation explicitly corroborates it.
 Mistral can never determine or override an outcome, risk, assurance result,
 verification status, source identity, or activity status.
 
-### Chunking, parallelism, and reduction
+### Chunking, parallelism, and deterministic session aggregation
 
 The reader streams `raw/rollout.jsonl` in bounded memory, preserves record and
 turn boundaries, and redacts before chunking. Oversized textual fields split only
@@ -1194,10 +1194,14 @@ field path, and part index.
 
 Independent chunk extractions run concurrently behind the existing typed Mistral
 semaphore (`MISTRAL_MAX_CONCURRENCY`, validated in the existing range of one to
-four; default two) and settle all results. Session consolidation runs only after
-all chunk outputs validate and receives validated claims rather than raw
-transcript text. Classification and transcript extraction run concurrently when
-independent, but projection waits for both required branches to settle.
+four; default two) and settle all results. Execution makes exactly one provider
+call for each missing chunk. After all chunk outputs validate, session
+presentation is aggregated deterministically from their cited episodes; this
+local composition incurs no additional provider call. A foundation-model session
+reducer is explicitly deferred until it has its own durable fingerprint,
+checkpoint, and receipt so retries cannot replay an uncheckpointed paid call.
+Classification and transcript extraction run concurrently when independent, but
+projection waits for both required branches to settle.
 
 The enrichment fingerprint is content-addressed from:
 
@@ -1933,8 +1937,8 @@ Deliver:
 ```text
 Mistral-only structured-output DTOs
 closed knowledge/entity/predicate enums
-bounded concurrent chunk map calls
-validated-claim reduction without raw transcript replay
+bounded concurrent chunk extraction calls
+deterministic cited-episode session aggregation with no reducer API call
 citation, size, endpoint, confidence, and secret-echo validation
 typed usage/cost attribution
 retry and all-results-settle behavior

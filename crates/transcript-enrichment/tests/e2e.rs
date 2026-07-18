@@ -20,8 +20,8 @@ use harness_graph_transcript_enrichment::{
     TokenRatePerMillion, TranscriptChunkPolicy, TranscriptChunkSegment, TranscriptDisclosureScope,
     TranscriptEnrichmentError, TranscriptInventoryAggregate, TranscriptInventoryEstimator,
     TranscriptPreparation, TranscriptPreparationBlockReason, TranscriptPreparationLimits,
-    TranscriptSpanToken, TranscriptTokenPricing, ValidatedChunkKnowledge,
-    prepare_verified_transcript,
+    TranscriptSessionEstimate, TranscriptSpanToken, TranscriptTokenPricing,
+    ValidatedChunkKnowledge, prepare_verified_transcript,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,7 @@ const RICH_SESSION: &str = "019c63db-2995-74c3-b898-c1b92a8e1317";
 const METADATA_SESSION: &str = "019c63db-2995-74c3-b898-c1b92a8e1318";
 const BLOCKED_SESSION: &str = "019c63db-2995-74c3-b898-c1b92a8e1319";
 const OVERSIZED_SESSION: &str = "019c63db-2995-74c3-b898-c1b92a8e1320";
+const SINGLE_CHUNK_SESSION: &str = "019c63db-2995-74c3-b898-c1b92a8e1321";
 const KNOWN_SECRET: &str = "mistral-secret-canary-123456";
 const PRIVATE_KEY: &str =
     "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA==\n-----END PRIVATE KEY-----";
@@ -160,14 +161,29 @@ fn pricing_and_inventory_use_provider_reported_tokens_without_provider_defaults(
     assert_eq!(actual.value(), 2_500_008);
 
     let temporary = tempfile::tempdir()?;
+    let metadata_records = metadata_only_records()?;
+    let metadata_bundle =
+        write_and_verify_bundle(temporary.path(), METADATA_SESSION, &metadata_records)?;
+    let metadata = prepare_default(metadata_bundle, TranscriptPreparationLimits::default())?;
+    let metadata_estimate = assert_estimator_reconciles_with_execution(&metadata, pricing, 128)?;
+    assert_eq!(metadata_estimate.chunk_count().value(), 0);
+    assert_eq!(metadata_estimate.estimated_cost().value(), 0);
+
+    let single_records = vec![record(
+        "event_msg",
+        json!({"type": "user_message", "message": "one source-safe extraction chunk"}),
+    )?];
+    let single_bundle =
+        write_and_verify_bundle(temporary.path(), SINGLE_CHUNK_SESSION, &single_records)?;
+    let single = prepare_default(single_bundle, TranscriptPreparationLimits::default())?;
+    let single_estimate = assert_estimator_reconciles_with_execution(&single, pricing, 128)?;
+    assert_eq!(single_estimate.chunk_count().value(), 1);
+
     let records = rich_records()?;
     let bundle = write_and_verify_bundle(temporary.path(), RICH_SESSION, &records)?;
     let preparation = prepare_default(bundle, TranscriptPreparationLimits::default())?;
-    let estimator =
-        TranscriptInventoryEstimator::new(pricing, EstimatedOutputTokensPerRequest::new(128)?);
-    let estimate = estimator.estimate(&preparation);
-    assert!(estimate.request_count().value() > 1);
-    assert!(estimate.estimated_cost().value() > 0);
+    let estimate = assert_estimator_reconciles_with_execution(&preparation, pricing, 128)?;
+    assert!(estimate.chunk_count().value() > 1);
     let mut aggregate = TranscriptInventoryAggregate::default();
     aggregate.include(&estimate);
     assert_eq!(aggregate.sessions().value(), 1);
@@ -177,6 +193,43 @@ fn pricing_and_inventory_use_provider_reported_tokens_without_provider_defaults(
     );
     assert!(aggregate.redaction_counts().total().value() >= 10);
     Ok(())
+}
+
+fn assert_estimator_reconciles_with_execution(
+    preparation: &TranscriptPreparation,
+    pricing: TranscriptTokenPricing,
+    output_per_request: u64,
+) -> Result<TranscriptSessionEstimate, Box<dyn std::error::Error>> {
+    let (expected_chunks, expected_input_tokens) = match preparation {
+        TranscriptPreparation::Prepared(prepared) => (
+            prepared.chunks().count().value(),
+            prepared.chunks().estimated_tokens().value(),
+        ),
+        TranscriptPreparation::MetadataOnly(_) | TranscriptPreparation::Blocked(_) => (0, 0),
+    };
+    let expected_output_tokens = expected_chunks.saturating_mul(output_per_request);
+    let estimator = TranscriptInventoryEstimator::new(
+        pricing,
+        EstimatedOutputTokensPerRequest::new(output_per_request)?,
+    );
+    let estimate = estimator.estimate(preparation);
+    assert_eq!(estimate.request_count().value(), expected_chunks);
+    assert_eq!(
+        estimate.estimated_input_tokens().value(),
+        expected_input_tokens
+    );
+    assert_eq!(
+        estimate.estimated_output_tokens().value(),
+        expected_output_tokens
+    );
+    assert_eq!(
+        estimate.estimated_cost(),
+        pricing.cost(
+            TokenCount::new(expected_input_tokens),
+            TokenCount::new(expected_output_tokens),
+        )
+    );
+    Ok(estimate)
 }
 
 #[test]
