@@ -340,7 +340,7 @@ impl RigMistralAdapter {
     ///
     /// Returns an error for provider authentication or transport failures.
     pub async fn health(&self) -> Result<(), MistralAdapterError> {
-        let _permit = self.acquire_permit().await?;
+        let _permit = self.acquire_provider_admission().await?;
         let models = tokio::time::timeout(PROVIDER_REQUEST_TIMEOUT, self.client.list_models())
             .await
             .map_err(|_| MistralAdapterError::RequestTimeout {
@@ -403,11 +403,14 @@ impl RigMistralAdapter {
         }
     }
 
-    async fn acquire_permit(&self) -> Result<SemaphorePermit<'_>, MistralAdapterError> {
-        self.permits
+    async fn acquire_provider_admission(&self) -> Result<SemaphorePermit<'_>, MistralAdapterError> {
+        let permit = self
+            .permits
             .acquire()
             .await
-            .map_err(|_| MistralAdapterError::ConcurrencyClosed)
+            .map_err(|_| MistralAdapterError::ConcurrencyClosed)?;
+        self.retry_gate.wait_until_open().await;
+        Ok(permit)
     }
 }
 
@@ -566,7 +569,7 @@ impl TaskClassifier for RigMistralAdapter {
         &self,
         request: TaskClassificationRequest,
     ) -> Result<ModelResult<ClassifiedTask>, Self::Error> {
-        let _permit = self.acquire_permit().await?;
+        let _permit = self.acquire_provider_admission().await?;
         let agent = self
             .client
             .agent(self.model.as_str())
@@ -609,7 +612,7 @@ impl NarrativeInterpreter for RigMistralAdapter {
         &self,
         request: NarrativeRequest,
     ) -> Result<ModelResult<NarrativeSummary>, Self::Error> {
-        let _permit = self.acquire_permit().await?;
+        let _permit = self.acquire_provider_admission().await?;
         let source_count = request.activities().iter().count();
         let target = narrative_target(source_count);
         let groups = partition_narrative_evidence(&request, target);
@@ -654,7 +657,7 @@ impl Pathfinder for RigMistralAdapter {
         context: PlanningContext,
         precedents: PrecedentPaths,
     ) -> Result<ModelResult<CandidatePlan>, Self::Error> {
-        let _permit = self.acquire_permit().await?;
+        let _permit = self.acquire_provider_admission().await?;
         let prompt = render_pathfinder_prompt(&context, &precedents);
         let agent = self
             .client

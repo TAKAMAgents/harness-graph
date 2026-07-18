@@ -14,6 +14,8 @@ pub enum RunConfigurationField {
     DisclosureScope,
     /// Operator-reviewed authorization policy.
     AuthorizationPolicyDigest,
+    /// Exact immutable foundation-model prompt body.
+    PromptDigest,
     /// Mandatory local redaction policy.
     RedactionPolicyVersion,
     /// Deterministic chunking policy.

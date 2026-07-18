@@ -10,6 +10,8 @@ const SOURCE_ONE_ID = 'a'.repeat(64)
 const SOURCE_TWO_ID = 'b'.repeat(64)
 const CONTENT_ONE_DIGEST = 'c'.repeat(64)
 const CONTENT_TWO_DIGEST = 'd'.repeat(64)
+const AUTHORIZATION_POLICY_DIGEST = 'e'.repeat(64)
+const PROMPT_DIGEST = 'f'.repeat(64)
 
 const enrichedDisplay = {
   source: 'enrichment',
@@ -71,6 +73,9 @@ export const sessionDetails = new Map([
         provider: 'mistral',
         model: 'mistral-small-2603',
         prompt_version: 'transcript-knowledge-v1',
+        disclosure_scope: 'conversation_and_execution',
+        authorization_policy_digest: AUTHORIZATION_POLICY_DIGEST,
+        prompt_digest: PROMPT_DIGEST,
         schema_version: 'knowledge-overlay-v1',
         confidence: 'high',
         epistemic_status: 'explicit',

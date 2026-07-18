@@ -141,6 +141,16 @@ digest_identifier!(
     "enrichment output digest",
     "Digest of one citation-validated chunk result."
 );
+digest_identifier!(
+    EnrichmentAuthorizationPolicyDigest,
+    "enrichment authorization policy digest",
+    "Digest of the exact operator-reviewed disclosure policy."
+);
+digest_identifier!(
+    EnrichmentPromptDigest,
+    "enrichment prompt digest",
+    "Digest of the exact immutable foundation-model prompt body."
+);
 
 /// Opaque identity of one process-local enrichment invocation.
 ///
@@ -371,6 +381,85 @@ impl EnrichmentProvider {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         "mistral"
+    }
+}
+
+/// Closed transcript classes authorized for one enrichment run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichmentDisclosureScope {
+    /// User, agent, collaborator, and completion messages only.
+    ConversationOnly,
+    /// Conversation plus textual tool requests, results, patches, and errors.
+    ConversationAndExecution,
+}
+
+impl EnrichmentDisclosureScope {
+    /// Stable graph representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationOnly => "conversation_only",
+            Self::ConversationAndExecution => "conversation_and_execution",
+        }
+    }
+
+    /// Parse the closed graph representation at a persistence boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source-safe error when persisted data is outside the closed vocabulary.
+    pub fn parse(value: &str) -> Result<Self, EnrichmentGraphError> {
+        match value {
+            "conversation_only" => Ok(Self::ConversationOnly),
+            "conversation_and_execution" => Ok(Self::ConversationAndExecution),
+            _ => Err(EnrichmentGraphError::InvalidIdentifier {
+                field: "enrichment disclosure scope",
+                maximum: 26,
+            }),
+        }
+    }
+}
+
+/// Source-safe audit product retained with every immutable enrichment run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EnrichmentRunAuditProvenance {
+    disclosure_scope: EnrichmentDisclosureScope,
+    authorization_policy_digest: EnrichmentAuthorizationPolicyDigest,
+    prompt_digest: EnrichmentPromptDigest,
+}
+
+impl EnrichmentRunAuditProvenance {
+    /// Construct exact authorization and prompt provenance.
+    #[must_use]
+    pub const fn new(
+        disclosure_scope: EnrichmentDisclosureScope,
+        authorization_policy_digest: EnrichmentAuthorizationPolicyDigest,
+        prompt_digest: EnrichmentPromptDigest,
+    ) -> Self {
+        Self {
+            disclosure_scope,
+            authorization_policy_digest,
+            prompt_digest,
+        }
+    }
+
+    /// Exact externally authorized transcript classes.
+    #[must_use]
+    pub const fn disclosure_scope(self) -> EnrichmentDisclosureScope {
+        self.disclosure_scope
+    }
+
+    /// Digest of the operator-reviewed disclosure policy.
+    #[must_use]
+    pub const fn authorization_policy_digest(self) -> EnrichmentAuthorizationPolicyDigest {
+        self.authorization_policy_digest
+    }
+
+    /// Digest of the exact immutable prompt body.
+    #[must_use]
+    pub const fn prompt_digest(self) -> EnrichmentPromptDigest {
+        self.prompt_digest
     }
 }
 
@@ -1046,6 +1135,7 @@ pub struct EnrichmentRunSpec {
     provider: EnrichmentProvider,
     model: EnrichmentModelName,
     prompt_version: PromptVersion,
+    audit_provenance: EnrichmentRunAuditProvenance,
     schema_version: EnrichmentSchemaVersion,
     redaction_version: RedactionPolicyVersion,
     chunking_version: ChunkingPolicyVersion,
@@ -1065,6 +1155,7 @@ impl EnrichmentRunSpec {
         provider: EnrichmentProvider,
         model: EnrichmentModelName,
         prompt_version: PromptVersion,
+        audit_provenance: EnrichmentRunAuditProvenance,
         schema_version: EnrichmentSchemaVersion,
         redaction_version: RedactionPolicyVersion,
         chunking_version: ChunkingPolicyVersion,
@@ -1079,6 +1170,7 @@ impl EnrichmentRunSpec {
             provider,
             model,
             prompt_version,
+            audit_provenance,
             schema_version,
             redaction_version,
             chunking_version,
@@ -1125,6 +1217,11 @@ impl EnrichmentRunSpec {
     #[must_use]
     pub const fn prompt_version(&self) -> &PromptVersion {
         &self.prompt_version
+    }
+    /// Exact source-safe authorization and prompt audit provenance.
+    #[must_use]
+    pub const fn audit_provenance(&self) -> EnrichmentRunAuditProvenance {
+        self.audit_provenance
     }
     /// Output schema version.
     #[must_use]
@@ -2754,6 +2851,25 @@ mod tests {
             format!("\"{}\"", "a".repeat(64))
         );
         assert!(NarrativeTitle::new("unsafe\u{0}title").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn run_audit_provenance_is_closed_content_addressed_and_source_safe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let authorization = digest("b", EnrichmentAuthorizationPolicyDigest::parse_hex)?;
+        let prompt = digest("c", EnrichmentPromptDigest::parse_hex)?;
+        let provenance = EnrichmentRunAuditProvenance::new(
+            EnrichmentDisclosureScope::ConversationAndExecution,
+            authorization,
+            prompt,
+        );
+        let value = serde_json::to_value(provenance)?;
+        assert_eq!(value["disclosure_scope"], "conversation_and_execution");
+        assert_eq!(value["authorization_policy_digest"], authorization.to_hex());
+        assert_eq!(value["prompt_digest"], prompt.to_hex());
+        assert!(EnrichmentDisclosureScope::parse("conversation_only").is_ok());
+        assert!(EnrichmentDisclosureScope::parse("unbounded_scope").is_err());
         Ok(())
     }
 

@@ -31,7 +31,12 @@ use harness_graph_transcript_enrichment::{
 use rig::providers::mistral;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle, time::Instant};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+    time::Instant,
+};
 
 use super::{
     MAX_SOURCE_COPY_SCALARS, MISTRAL_TRANSCRIPT_KNOWLEDGE_MODEL, MistralTranscriptPromptProvenance,
@@ -228,6 +233,8 @@ enum ContractScenario {
 struct ContractState {
     scenario: ContractScenario,
     requests: AtomicU64,
+    request_changed: Notify,
+    request_arrivals: Mutex<Vec<Instant>>,
     observations: Mutex<Vec<ContractObservation>>,
 }
 
@@ -254,6 +261,8 @@ impl ContractServer {
         let state = Arc::new(ContractState {
             scenario,
             requests: AtomicU64::new(0),
+            request_changed: Notify::new(),
+            request_arrivals: Mutex::new(Vec::new()),
             observations: Mutex::new(Vec::new()),
         });
         let app = Router::new()
@@ -275,8 +284,22 @@ impl ContractServer {
         self.state.requests.load(Ordering::SeqCst)
     }
 
+    async fn wait_for_request_count(&self, minimum: u64) {
+        loop {
+            let changed = self.state.request_changed.notified();
+            if self.request_count() >= minimum {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     async fn observations(&self) -> Vec<ContractObservation> {
         self.state.observations.lock().await.clone()
+    }
+
+    async fn request_arrivals(&self) -> Vec<Instant> {
+        self.state.request_arrivals.lock().await.clone()
     }
 }
 
@@ -333,6 +356,8 @@ async fn contract_completion(
     Json(request): Json<ContractRequest>,
 ) -> Response {
     let request_index = state.requests.fetch_add(1, Ordering::SeqCst);
+    state.request_arrivals.lock().await.push(Instant::now());
+    state.request_changed.notify_waiters();
     let inspection = inspect_contract_request(&headers, &request);
     state.observations.lock().await.push(inspection.observation);
     if inspection.observation == ContractObservation::Invalid {
@@ -743,6 +768,51 @@ async fn contract_429_honors_retry_after_before_retrying() -> Result<(), Box<dyn
     assert!(started.elapsed() >= Duration::from_millis(950));
     assert_eq!(result.attempts, ProviderAttemptCount::from_value(2));
     assert_eq!(server.request_count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn contract_shared_retry_gate_pre_gates_queued_and_new_requests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let prepared = source_safe_fixture(1024 * 1024)?;
+    let chunk = first_chunk(&prepared)?.clone();
+    let server = ContractServer::start(ContractScenario::RateLimitedOnce).await?;
+    let adapter = Arc::new(contract_adapter(
+        &server.base_url,
+        Duration::from_secs(5),
+        MistralConcurrencyLimit::new(2)?,
+    )?);
+
+    let first_adapter = adapter.clone();
+    let first_chunk = chunk.clone();
+    let first = tokio::spawn(async move {
+        first_adapter
+            .extract_chunk_with_metadata(&first_chunk)
+            .await
+    });
+    server.wait_for_request_count(1).await;
+    adapter.retry_gate.wait_until_delayed().await;
+
+    let second_adapter = adapter.clone();
+    let second =
+        tokio::spawn(async move { second_adapter.extract_chunk_with_metadata(&chunk).await });
+    let first_result = first.await??;
+    let second_result = second.await??;
+    assert_eq!(first_result.attempts, ProviderAttemptCount::from_value(2));
+    assert_eq!(second_result.attempts, ProviderAttemptCount::from_value(1));
+    assert_eq!(server.request_count(), 3);
+    let arrivals = server.request_arrivals().await;
+    let first_arrival = arrivals
+        .first()
+        .copied()
+        .ok_or("contract server recorded no request arrival")?;
+    assert!(
+        arrivals
+            .iter()
+            .skip(1)
+            .all(|arrival| arrival.duration_since(first_arrival) >= Duration::from_millis(950)),
+        "every queued or new request must honor the shared provider retry window"
+    );
     Ok(())
 }
 

@@ -11,19 +11,20 @@ use harness_graph_graph_port::{
     EnrichmentChunkCount, EnrichmentChunkLeaseRelease, EnrichmentChunkProjection,
     EnrichmentFailureStatus, EnrichmentGraphCommand, EnrichmentLookup, EnrichmentModelName,
     EnrichmentProjectionDisposition, EnrichmentProjectionReceipt, EnrichmentProjector,
-    EnrichmentProvider, EnrichmentQuery, EnrichmentReader, EnrichmentRunId, EnrichmentRunLifecycle,
-    EnrichmentRunLifecycleQuery, EnrichmentRunRef, EnrichmentRunSpec, EnrichmentSchemaVersion,
-    EnrichmentUnavailableReason, EpisodeOrdinal, EpistemicStatus, KnowledgeClaimId,
-    KnowledgeClaimProjection, KnowledgeClaimSubjects, KnowledgeClaimTitle, KnowledgeClaims,
-    KnowledgeConfidence, KnowledgeEntities, KnowledgeEntityId, KnowledgeEntityKind,
-    KnowledgeEntityName, KnowledgeEntityProjection, KnowledgeKind, KnowledgePredicate,
-    KnowledgeRelationId, KnowledgeRelationProjection, KnowledgeRelations, KnowledgeStatement,
-    MarkEnrichmentRunFailedCommand, NarrativeEpisodeId, NarrativeEpisodeProjection,
-    NarrativeEpisodes, NarrativeSummary, NarrativeTitle, ObservationCorroboration,
-    ProjectClaimedEnrichmentChunkCommand, ProjectEnrichmentChunkCommand, PromptVersion,
-    RedactionPolicyVersion, ReleaseEnrichmentChunkLeaseCommand, SelectedEnrichment, SpanCitations,
-    TranscriptByteCount, TranscriptField, TranscriptFieldOrdinal, TranscriptPartIndex,
-    TranscriptRole, TranscriptSpanId, TranscriptSpanProjection, TranscriptSpans,
+    EnrichmentProvider, EnrichmentQuery, EnrichmentReader, EnrichmentRunAuditProvenance,
+    EnrichmentRunId, EnrichmentRunLifecycle, EnrichmentRunLifecycleQuery, EnrichmentRunRef,
+    EnrichmentRunSpec, EnrichmentSchemaVersion, EnrichmentUnavailableReason, EpisodeOrdinal,
+    EpistemicStatus, KnowledgeClaimId, KnowledgeClaimProjection, KnowledgeClaimSubjects,
+    KnowledgeClaimTitle, KnowledgeClaims, KnowledgeConfidence, KnowledgeEntities,
+    KnowledgeEntityId, KnowledgeEntityKind, KnowledgeEntityName, KnowledgeEntityProjection,
+    KnowledgeKind, KnowledgePredicate, KnowledgeRelationId, KnowledgeRelationProjection,
+    KnowledgeRelations, KnowledgeStatement, MarkEnrichmentRunFailedCommand, NarrativeEpisodeId,
+    NarrativeEpisodeProjection, NarrativeEpisodes, NarrativeSummary, NarrativeTitle,
+    ObservationCorroboration, ProjectClaimedEnrichmentChunkCommand, ProjectEnrichmentChunkCommand,
+    PromptVersion, RedactionPolicyVersion, ReleaseEnrichmentChunkLeaseCommand, SelectedEnrichment,
+    SpanCitations, TranscriptByteCount, TranscriptField, TranscriptFieldOrdinal,
+    TranscriptPartIndex, TranscriptRole, TranscriptSpanId, TranscriptSpanProjection,
+    TranscriptSpans,
 };
 use neo4rs::{Query, Row, query};
 
@@ -51,6 +52,9 @@ const BEGIN_RUN_QUERY: &str = "MATCH (session:HGSession {key: $session_key})-[:I
      ON CREATE SET run.hg_namespace = $namespace, run.run_id = $run_id, \
        run.source_digest = $source_digest, run.fingerprint = $fingerprint, \
        run.provider = $provider, run.model = $model, run.prompt_version = $prompt_version, \
+       run.disclosure_scope = $disclosure_scope, \
+       run.authorization_policy_digest = $authorization_policy_digest, \
+       run.prompt_digest = $prompt_digest, \
        run.schema_version = $schema_version, run.redaction_version = $redaction_version, \
        run.chunking_version = $chunking_version, run.expected_chunks = $expected_chunks, \
        run.status = 'planned', run.created_at = datetime() \
@@ -58,7 +62,10 @@ const BEGIN_RUN_QUERY: &str = "MATCH (session:HGSession {key: $session_key})-[:I
      WHERE run.hg_namespace = $namespace AND run.run_id = $run_id \
        AND run.source_digest = $source_digest AND run.fingerprint = $fingerprint \
        AND run.provider = $provider AND run.model = $model \
-       AND run.prompt_version = $prompt_version AND run.schema_version = $schema_version \
+       AND run.prompt_version = $prompt_version \
+       AND run.disclosure_scope = $disclosure_scope \
+       AND run.authorization_policy_digest = $authorization_policy_digest \
+       AND run.prompt_digest = $prompt_digest AND run.schema_version = $schema_version \
        AND run.redaction_version = $redaction_version \
        AND run.chunking_version = $chunking_version AND run.expected_chunks = $expected_chunks \
      MERGE (src)-[:HAS_ENRICHMENT_RUN]->(run) \
@@ -69,7 +76,10 @@ const RUN_PREFLIGHT_QUERY: &str = "OPTIONAL MATCH (run:HGEnrichmentRun {key: $ru
        run.hg_namespace = $namespace AND run.run_id = $run_id \
        AND run.source_digest = $source_digest AND run.fingerprint = $fingerprint \
        AND run.provider = $provider AND run.model = $model \
-       AND run.prompt_version = $prompt_version AND run.schema_version = $schema_version \
+       AND run.prompt_version = $prompt_version \
+       AND run.disclosure_scope = $disclosure_scope \
+       AND run.authorization_policy_digest = $authorization_policy_digest \
+       AND run.prompt_digest = $prompt_digest AND run.schema_version = $schema_version \
        AND run.redaction_version = $redaction_version \
        AND run.chunking_version = $chunking_version AND run.expected_chunks = $expected_chunks, \
        false) AS identical";
@@ -121,6 +131,9 @@ const SELECTED_RUN_QUERY: &str = "OPTIONAL MATCH (session:HGSession {key: $sessi
        coalesce(run.run_id, '') AS run_id, coalesce(run.fingerprint, '') AS fingerprint, \
        coalesce(run.provider, '') AS provider, coalesce(run.model, '') AS model, \
        coalesce(run.prompt_version, '') AS prompt_version, \
+       coalesce(run.disclosure_scope, '') AS disclosure_scope, \
+       coalesce(run.authorization_policy_digest, '') AS authorization_policy_digest, \
+       coalesce(run.prompt_digest, '') AS prompt_digest, \
        coalesce(run.schema_version, '') AS schema_version, \
        coalesce(run.redaction_version, '') AS redaction_version, \
        coalesce(run.chunking_version, '') AS chunking_version, \
@@ -1037,6 +1050,20 @@ fn run_params(mut statement: Query, run: &EnrichmentRunSpec) -> Result<Query, Ne
         .param("provider", run.provider().as_str())
         .param("model", run.model().as_str())
         .param("prompt_version", run.prompt_version().as_str())
+        .param(
+            "disclosure_scope",
+            run.audit_provenance().disclosure_scope().as_str(),
+        )
+        .param(
+            "authorization_policy_digest",
+            run.audit_provenance()
+                .authorization_policy_digest()
+                .to_hex(),
+        )
+        .param(
+            "prompt_digest",
+            run.audit_provenance().prompt_digest().to_hex(),
+        )
         .param("schema_version", run.schema_version().as_str())
         .param("redaction_version", run.redaction_version().as_str())
         .param("chunking_version", run.chunking_version().as_str())
@@ -1556,6 +1583,19 @@ fn read_run_spec(
         EnrichmentProvider::Mistral,
         EnrichmentModelName::new(read_property::<String>(row, "model")?)?,
         PromptVersion::new(read_property::<String>(row, "prompt_version")?)?,
+        EnrichmentRunAuditProvenance::new(
+            harness_graph_graph_port::EnrichmentDisclosureScope::parse(&read_property::<String>(
+                row,
+                "disclosure_scope",
+            )?)?,
+            harness_graph_graph_port::EnrichmentAuthorizationPolicyDigest::parse_hex(
+                &read_property::<String>(row, "authorization_policy_digest")?,
+            )?,
+            harness_graph_graph_port::EnrichmentPromptDigest::parse_hex(&read_property::<String>(
+                row,
+                "prompt_digest",
+            )?)?,
+        ),
         EnrichmentSchemaVersion::new(read_property::<String>(row, "schema_version")?)?,
         RedactionPolicyVersion::new(read_property::<String>(row, "redaction_version")?)?,
         ChunkingPolicyVersion::new(read_property::<String>(row, "chunking_version")?)?,
@@ -1745,6 +1785,20 @@ mod tests {
         assert!(FAILURE_PREFLIGHT_QUERY.contains("terminal_failed"));
         assert!(!MARK_RUN_FAILED_QUERY.contains("SELECTS"));
         assert!(SELECTED_RUN_QUERY.contains("HGEnrichmentRun {status: 'completed'}"));
+    }
+
+    #[test]
+    fn run_audit_provenance_is_persisted_identity_checked_and_selected() {
+        for field in [
+            "disclosure_scope",
+            "authorization_policy_digest",
+            "prompt_digest",
+        ] {
+            let parameter = format!("${field}");
+            assert!(BEGIN_RUN_QUERY.contains(&format!("run.{field} = {parameter}")));
+            assert!(RUN_PREFLIGHT_QUERY.contains(&format!("run.{field} = {parameter}")));
+            assert!(SELECTED_RUN_QUERY.contains(&format!("run.{field}")));
+        }
     }
 
     #[test]
@@ -2489,6 +2543,11 @@ mod tests {
             EnrichmentProvider::Mistral,
             EnrichmentModelName::new("mistral-small-latest")?,
             PromptVersion::new(prompt)?,
+            EnrichmentRunAuditProvenance::new(
+                harness_graph_graph_port::EnrichmentDisclosureScope::ConversationAndExecution,
+                harness_graph_graph_port::EnrichmentAuthorizationPolicyDigest::parse_hex(&value)?,
+                harness_graph_graph_port::EnrichmentPromptDigest::parse_hex(&value)?,
+            ),
             EnrichmentSchemaVersion::new("schema-v1")?,
             RedactionPolicyVersion::new("redaction-v1")?,
             ChunkingPolicyVersion::new("chunking-v1")?,
@@ -2632,6 +2691,22 @@ mod tests {
             return Err("expected selected completed enrichment".into());
         };
         assert_eq!(selected.run().fingerprint(), fingerprint);
+        assert_eq!(
+            selected.run().audit_provenance().disclosure_scope(),
+            harness_graph_graph_port::EnrichmentDisclosureScope::ConversationAndExecution
+        );
+        assert_eq!(
+            selected
+                .run()
+                .audit_provenance()
+                .authorization_policy_digest()
+                .to_hex(),
+            fingerprint.to_hex()
+        );
+        assert_eq!(
+            selected.run().audit_provenance().prompt_digest().to_hex(),
+            fingerprint.to_hex()
+        );
         assert_eq!(selected.spans().count(), RecordCount::new(1));
         assert_eq!(
             selected

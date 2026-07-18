@@ -1063,7 +1063,7 @@ impl RigMistralAdapter {
         let mut attempts = 0_u8;
         loop {
             attempts = attempts.saturating_add(1);
-            let permit = self.acquire_permit().await.map_err(|_| {
+            let permit = self.acquire_provider_admission().await.map_err(|_| {
                 TranscriptKnowledgeAdapterError::Provider {
                     class: TranscriptProviderFailureClass::ConcurrencyUnavailable,
                     attempts: ProviderAttemptCount::from_value(attempts),
@@ -1116,17 +1116,15 @@ impl RigMistralAdapter {
                 }
             }
             let exponential = retry_delay(attempts);
-            let delay = match self.retry_gate.instruction().await {
-                ProviderRetryInstruction::Absent => exponential,
-                ProviderRetryInstruction::Wait(provider_delay) => exponential.max(provider_delay),
+            match self.retry_gate.schedule_retry(exponential).await {
+                ProviderRetryInstruction::Absent | ProviderRetryInstruction::Wait(_) => {}
                 ProviderRetryInstruction::ExceedsBound => {
                     return Err(TranscriptKnowledgeAdapterError::Provider {
                         class: TranscriptProviderFailureClass::RetryAfterExceedsBound,
                         attempts: ProviderAttemptCount::from_value(attempts),
                     });
                 }
-            };
-            tokio::time::sleep(delay).await;
+            }
         }
     }
 }

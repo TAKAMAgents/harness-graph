@@ -10,7 +10,10 @@ use rig::{
     },
     wasm_compat::WasmCompatSend,
 };
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::{Mutex, Notify},
+    time::Instant,
+};
 
 const MAX_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(90);
 
@@ -26,15 +29,25 @@ pub(crate) enum ProviderRetryInstruction {
 }
 
 /// Shared rate-limit gate for concurrent requests from one Mistral adapter.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct ProviderRetryGate {
     state: Arc<Mutex<ProviderRetryState>>,
+    changed: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ProviderRetryState {
     not_before: Option<Instant>,
     exceeds_bound: bool,
+}
+
+impl Default for ProviderRetryGate {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ProviderRetryState::default())),
+            changed: Arc::new(Notify::new()),
+        }
+    }
 }
 
 impl ProviderRetryGate {
@@ -52,24 +65,66 @@ impl ProviderRetryGate {
             }
             ProviderRetryInstruction::ExceedsBound => state.exceeds_bound = true,
         }
+        drop(state);
+        self.changed.notify_waiters();
     }
 
-    /// Resolve the shared provider delay after one transient response.
-    pub(crate) async fn instruction(&self) -> ProviderRetryInstruction {
+    /// Extend the shared gate with a retry's minimum exponential backoff.
+    pub(crate) async fn schedule_retry(
+        &self,
+        minimum_backoff: Duration,
+    ) -> ProviderRetryInstruction {
         let mut state = self.state.lock().await;
         if state.exceeds_bound {
             state.exceeds_bound = false;
             return ProviderRetryInstruction::ExceedsBound;
         }
-        let Some(not_before) = state.not_before else {
-            return ProviderRetryInstruction::Absent;
-        };
+        let candidate = Instant::now() + minimum_backoff;
+        let not_before = state
+            .not_before
+            .map_or(candidate, |current| current.max(candidate));
+        state.not_before = Some(not_before);
         let delay = not_before.saturating_duration_since(Instant::now());
-        if delay.is_zero() {
-            state.not_before = None;
-            ProviderRetryInstruction::Absent
-        } else {
-            ProviderRetryInstruction::Wait(delay)
+        drop(state);
+        self.changed.notify_waiters();
+        ProviderRetryInstruction::Wait(delay)
+    }
+
+    /// Wait until every observed Retry-After and scheduled backoff has elapsed.
+    pub(crate) async fn wait_until_open(&self) {
+        loop {
+            let deadline = {
+                let mut state = self.state.lock().await;
+                match state.not_before {
+                    Some(deadline) if deadline > Instant::now() => Some(deadline),
+                    Some(_) => {
+                        state.not_before = None;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            let Some(deadline) = deadline else {
+                return;
+            };
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_until_delayed(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self
+                .state
+                .lock()
+                .await
+                .not_before
+                .is_some_and(|deadline| deadline > Instant::now())
+            {
+                return;
+            }
+            changed.await;
         }
     }
 }

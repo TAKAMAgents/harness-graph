@@ -2,9 +2,11 @@
 
 use harness_graph_domain::{GraphNamespace, SessionId, SourceDigest};
 use harness_graph_graph_port::{
-    ChunkingPolicyVersion as GraphChunkingPolicyVersion, EnrichmentChunkCount,
-    EnrichmentFingerprint, EnrichmentProvider, EnrichmentRunId, EnrichmentRunRef,
-    EnrichmentRunSpec, RedactionPolicyVersion as GraphRedactionPolicyVersion,
+    ChunkingPolicyVersion as GraphChunkingPolicyVersion, EnrichmentAuthorizationPolicyDigest,
+    EnrichmentChunkCount, EnrichmentDisclosureScope, EnrichmentFingerprint,
+    EnrichmentPromptDigest as GraphEnrichmentPromptDigest, EnrichmentProvider,
+    EnrichmentRunAuditProvenance, EnrichmentRunId, EnrichmentRunRef, EnrichmentRunSpec,
+    RedactionPolicyVersion as GraphRedactionPolicyVersion,
 };
 pub use harness_graph_graph_port::{EnrichmentModelName, EnrichmentSchemaVersion, PromptVersion};
 use harness_graph_transcript_enrichment::{
@@ -270,6 +272,29 @@ pub fn plan_enrichment_run(
         })?;
     let fingerprint = derive_fingerprint(prepared, configuration, expected_chunks)?;
     let run_id = derive_run_id(fingerprint)?;
+    let disclosure_scope = match configuration.disclosure_scope {
+        TranscriptDisclosureScope::ConversationOnly => EnrichmentDisclosureScope::ConversationOnly,
+        TranscriptDisclosureScope::ConversationAndExecution => {
+            EnrichmentDisclosureScope::ConversationAndExecution
+        }
+    };
+    let authorization_policy_digest = EnrichmentAuthorizationPolicyDigest::parse_hex(
+        &configuration.authorization_policy_digest.to_hex(),
+    )
+    .map_err(|_| EnrichmentApplicationError::InvalidRunConfiguration {
+        field: RunConfigurationField::AuthorizationPolicyDigest,
+    })?;
+    let prompt_digest = GraphEnrichmentPromptDigest::parse_hex(
+        &configuration.prompt_digest.to_hex(),
+    )
+    .map_err(|_| EnrichmentApplicationError::InvalidRunConfiguration {
+        field: RunConfigurationField::PromptDigest,
+    })?;
+    let audit_provenance = EnrichmentRunAuditProvenance::new(
+        disclosure_scope,
+        authorization_policy_digest,
+        prompt_digest,
+    );
     let specification = EnrichmentRunSpec::new(
         configuration.namespace.clone(),
         configuration.session_id,
@@ -279,6 +304,7 @@ pub fn plan_enrichment_run(
         EnrichmentProvider::Mistral,
         configuration.model.clone(),
         configuration.prompt_version.clone(),
+        audit_provenance,
         configuration.schema_version.clone(),
         configuration.graph_redaction_version.clone(),
         configuration.graph_chunking_version.clone(),

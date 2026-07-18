@@ -564,6 +564,15 @@ mod tests {
             assert_eq!(enriched_json["enrichment"]["state"], "completed");
             assert_eq!(enriched_json["enrichment"]["provider"], "mistral");
             assert_eq!(
+                enriched_json["enrichment"]["disclosure_scope"],
+                "conversation_and_execution"
+            );
+            assert_eq!(
+                enriched_json["enrichment"]["authorization_policy_digest"],
+                "e".repeat(64)
+            );
+            assert_eq!(enriched_json["enrichment"]["prompt_digest"], "f".repeat(64));
+            assert_eq!(
                 enriched_json["enrichment"]["episodes"][0]["epistemic_status"],
                 "explicit"
             );
@@ -611,6 +620,13 @@ mod tests {
             EnrichmentProvider::Mistral,
             EnrichmentModelName::new("mistral-small-2603")?,
             PromptVersion::new("experience-e2e-prompt-v1")?,
+            harness_graph_graph_port::EnrichmentRunAuditProvenance::new(
+                harness_graph_graph_port::EnrichmentDisclosureScope::ConversationAndExecution,
+                harness_graph_graph_port::EnrichmentAuthorizationPolicyDigest::parse_hex(
+                    &"e".repeat(64),
+                )?,
+                harness_graph_graph_port::EnrichmentPromptDigest::parse_hex(&"f".repeat(64))?,
+            ),
             EnrichmentSchemaVersion::new("experience-e2e-schema-v1")?,
             RedactionPolicyVersion::new("experience-e2e-redaction-v1")?,
             ChunkingPolicyVersion::new("experience-e2e-chunking-v1")?,

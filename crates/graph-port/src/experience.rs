@@ -10,7 +10,8 @@ use harness_graph_domain::{
 use serde::{Serialize, Serializer};
 
 use crate::{
-    EnrichmentModelName, EnrichmentProvider, EnrichmentRunId, EnrichmentSchemaVersion,
+    EnrichmentAuthorizationPolicyDigest, EnrichmentDisclosureScope, EnrichmentModelName,
+    EnrichmentPromptDigest, EnrichmentProvider, EnrichmentRunId, EnrichmentSchemaVersion,
     EpistemicStatus, KnowledgeClaimProjection, KnowledgeClaimSubjects, KnowledgeConfidence,
     KnowledgeEntityId, KnowledgeEntityProjection, KnowledgePredicate, KnowledgeRelationProjection,
     NarrativeEpisodeProjection, PromptVersion, SelectedEnrichment, TranscriptSpanId,
@@ -170,14 +171,14 @@ fn bounded_text(
     if trimmed.is_empty() || contains_forbidden_display_value(trimmed) {
         return Err(ExperienceGraphError::InvalidDisplayText { field, maximum });
     }
-    let value = trimmed.chars().take(maximum).collect::<String>();
-    if value
-        .chars()
-        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    if trimmed.chars().count() > maximum
+        || trimmed
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
     {
         return Err(ExperienceGraphError::InvalidDisplayText { field, maximum });
     }
-    Ok(value)
+    Ok(trimmed.to_owned())
 }
 
 fn contains_forbidden_display_value(value: &str) -> bool {
@@ -1033,6 +1034,9 @@ pub struct CompletedExperienceEnrichment {
     provider: EnrichmentProvider,
     model: EnrichmentModelName,
     prompt_version: PromptVersion,
+    disclosure_scope: EnrichmentDisclosureScope,
+    authorization_policy_digest: EnrichmentAuthorizationPolicyDigest,
+    prompt_digest: EnrichmentPromptDigest,
     schema_version: EnrichmentSchemaVersion,
     confidence: KnowledgeConfidence,
     epistemic_status: EpistemicStatus,
@@ -1100,6 +1104,12 @@ impl ExperienceEnrichment {
             provider: value.run().provider(),
             model: value.run().model().clone(),
             prompt_version: value.run().prompt_version().clone(),
+            disclosure_scope: value.run().audit_provenance().disclosure_scope(),
+            authorization_policy_digest: value
+                .run()
+                .audit_provenance()
+                .authorization_policy_digest(),
+            prompt_digest: value.run().audit_provenance().prompt_digest(),
             schema_version: value.run().schema_version().clone(),
             confidence: first.confidence,
             epistemic_status: first.epistemic_status,
@@ -1347,5 +1357,24 @@ mod tests {
         ] {
             assert!(ExperienceTitle::bounded(forbidden).is_err());
         }
+    }
+
+    #[test]
+    fn display_boundary_rejects_oversized_semantic_output_without_truncation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let oversized = "a".repeat(161);
+        let Some(error) = ExperienceTitle::bounded(&oversized).err() else {
+            return Err("oversized semantic title was silently accepted".into());
+        };
+        assert!(matches!(
+            error,
+            ExperienceGraphError::InvalidDisplayText {
+                field: "experience title",
+                maximum: 160,
+            }
+        ));
+        assert!(ExperienceTitle::bounded(&"é".repeat(160)).is_ok());
+        assert!(ExperienceTitle::bounded(&"é".repeat(161)).is_err());
+        Ok(())
     }
 }

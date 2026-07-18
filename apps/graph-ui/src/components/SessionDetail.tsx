@@ -122,6 +122,18 @@ function Provenance({ session }: SessionDetailProps) {
           <dd className="mt-1.5 break-all text-sm font-semibold">{session.enrichment.prompt_version}</dd>
         </div>
         <div className="bg-white/[0.045] p-4">
+          <dt className="text-[0.62rem] font-bold tracking-[0.12em] text-paper/40 uppercase">Disclosure scope</dt>
+          <dd className="mt-1.5 text-sm font-semibold">{displayLabel(session.enrichment.disclosure_scope)}</dd>
+        </div>
+        <div className="bg-white/[0.045] p-4">
+          <dt className="text-[0.62rem] font-bold tracking-[0.12em] text-paper/40 uppercase">Authorization policy digest</dt>
+          <dd className="mt-1.5 break-all font-mono text-xs text-paper/75">{session.enrichment.authorization_policy_digest}</dd>
+        </div>
+        <div className="bg-white/[0.045] p-4">
+          <dt className="text-[0.62rem] font-bold tracking-[0.12em] text-paper/40 uppercase">Exact prompt digest</dt>
+          <dd className="mt-1.5 break-all font-mono text-xs text-paper/75">{session.enrichment.prompt_digest}</dd>
+        </div>
+        <div className="bg-white/[0.045] p-4">
           <dt className="text-[0.62rem] font-bold tracking-[0.12em] text-paper/40 uppercase">Schema</dt>
           <dd className="mt-1.5 break-all text-sm font-semibold">{session.enrichment.schema_version}</dd>
         </div>
