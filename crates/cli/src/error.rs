@@ -1,9 +1,14 @@
 //! CLI error boundary.
 
+use harness_graph_assurance::AssuranceError;
+use harness_graph_classification::ClassificationError;
+use harness_graph_correlation::CorrelationError;
 use harness_graph_domain::DomainError;
 use harness_graph_graph_port::GraphPortError;
 use harness_graph_ingestion::IngestionError;
 use harness_graph_neo4j_adapter::Neo4jAdapterError;
+use harness_graph_path_analysis::PathAnalysisError;
+use harness_graph_risk::RiskError;
 
 /// Top-level command failure.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +40,26 @@ pub enum CliError {
     /// Archive ingestion failed.
     #[error(transparent)]
     Ingestion(#[from] IngestionError),
+
+    /// Native tool-call correlation failed.
+    #[error(transparent)]
+    Correlation(#[from] CorrelationError),
+
+    /// Semantic activity classification failed.
+    #[error(transparent)]
+    Classification(#[from] ClassificationError),
+
+    /// Evidence assurance assessment failed.
+    #[error(transparent)]
+    Assurance(#[from] AssuranceError),
+
+    /// Deterministic risk derivation failed.
+    #[error(transparent)]
+    Risk(#[from] RiskError),
+
+    /// Normalized execution-path derivation failed.
+    #[error(transparent)]
+    PathAnalysis(#[from] PathAnalysisError),
 
     /// Graph projection configuration failed validation.
     #[error(transparent)]

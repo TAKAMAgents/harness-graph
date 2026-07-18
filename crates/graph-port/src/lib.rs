@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use harness_graph_domain::{
-    DecodedNativeRecord, GraphNamespace, RecordCount, SessionId, SourceDigest,
+    AnalysisReport, DecodedNativeRecord, GraphNamespace, RecordCount, SessionId, SourceDigest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +101,57 @@ pub struct FinalizeIngestionCommand {
     total_records: RecordCount,
 }
 
+/// Complete deterministic analysis projection for one verified source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisProjectionCommand {
+    namespace: GraphNamespace,
+    session_id: SessionId,
+    source_digest: SourceDigest,
+    report: AnalysisReport,
+}
+
+impl AnalysisProjectionCommand {
+    /// Construct a typed analysis projection command.
+    #[must_use]
+    pub const fn new(
+        namespace: GraphNamespace,
+        session_id: SessionId,
+        source_digest: SourceDigest,
+        report: AnalysisReport,
+    ) -> Self {
+        Self {
+            namespace,
+            session_id,
+            source_digest,
+            report,
+        }
+    }
+
+    /// Graph namespace.
+    #[must_use]
+    pub const fn namespace(&self) -> &GraphNamespace {
+        &self.namespace
+    }
+
+    /// Session identity.
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Verified source digest.
+    #[must_use]
+    pub const fn source_digest(&self) -> SourceDigest {
+        self.source_digest
+    }
+
+    /// Deterministic report.
+    #[must_use]
+    pub const fn report(&self) -> &AnalysisReport {
+        &self.report
+    }
+}
+
 impl FinalizeIngestionCommand {
     /// Construct final ingestion counts.
     #[must_use]
@@ -175,6 +226,8 @@ pub enum GraphCommand {
     },
     /// Persist completion counts only after record projection succeeds.
     FinalizeIngestion(FinalizeIngestionCommand),
+    /// Project deterministic correlations, activities, outcome, risks, and path.
+    UpsertAnalysis(AnalysisProjectionCommand),
 }
 
 /// Non-empty bounded transaction command batch.

@@ -68,6 +68,28 @@ fn archive_discovery_verification_and_streaming_are_end_to_end()
 }
 
 #[test]
+fn deterministic_analysis_preserves_partial_calls_and_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = run_json(&["analyze", "--session-id", SESSION_ID])?;
+    assert_eq!(output["status"], "analyzed");
+    assert_eq!(output["analysis"]["tool_calls"], 2);
+    assert_eq!(output["analysis"]["completed_tool_calls"], 1);
+    assert_eq!(output["analysis"]["pending_tool_calls"], 0);
+    assert_eq!(output["analysis"]["interrupted_tool_calls"], 0);
+    assert_eq!(output["analysis"]["orphaned_tool_results"], 1);
+    assert_eq!(output["analysis"]["outcome_class"], "unverified_completion");
+    assert_eq!(output["analysis"]["verification_status"], "missing");
+    assert_eq!(output["analysis"]["risk_exposures"], 2);
+    assert_eq!(output["analysis"]["semantic_activities"], 4);
+    assert_eq!(output["analysis"]["path_steps"], 4);
+    assert_eq!(
+        output["analysis"]["path_signature"].as_str().map(str::len),
+        Some(64)
+    );
+    Ok(())
+}
+
+#[test]
 fn tampered_bundle_fails_before_semantic_parsing() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let destination = temporary.path().join("active/2026-02-16").join(SESSION_ID);

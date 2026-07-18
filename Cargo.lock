@@ -469,15 +469,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-graph-assurance"
+version = "0.1.0"
+dependencies = [
+ "harness-graph-domain",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "harness-graph-classification"
+version = "0.1.0"
+dependencies = [
+ "harness-graph-domain",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harness-graph-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
  "dotenvy",
+ "harness-graph-assurance",
+ "harness-graph-classification",
+ "harness-graph-correlation",
  "harness-graph-domain",
  "harness-graph-graph-port",
  "harness-graph-ingestion",
  "harness-graph-neo4j-adapter",
+ "harness-graph-path-analysis",
+ "harness-graph-risk",
  "secrecy",
  "serde",
  "serde_json",
@@ -487,6 +508,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "harness-graph-correlation"
+version = "0.1.0"
+dependencies = [
+ "harness-graph-domain",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -532,9 +561,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dotenvy",
+ "harness-graph-assurance",
+ "harness-graph-classification",
+ "harness-graph-correlation",
  "harness-graph-domain",
  "harness-graph-graph-port",
  "harness-graph-ingestion",
+ "harness-graph-path-analysis",
+ "harness-graph-risk",
  "neo4rs",
  "secrecy",
  "thiserror 2.0.18",
@@ -546,12 +580,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-graph-path-analysis"
+version = "0.1.0"
+dependencies = [
+ "harness-graph-domain",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "harness-graph-protocol"
 version = "0.1.0"
 dependencies = [
  "harness-graph-domain",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "harness-graph-risk"
+version = "0.1.0"
+dependencies = [
+ "harness-graph-domain",
  "thiserror 2.0.18",
 ]
 

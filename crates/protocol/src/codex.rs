@@ -1,9 +1,11 @@
 //! Typed Codex native-record decoder.
 
 use harness_graph_domain::{
-    CallAssociation, ContextAssociation, ContextDigest, DecodedNativeRecord, KnownNativeRecord,
-    NativeCallId, NativeRecordKind, Observation, ObservationKind, OccurredAt, PayloadDigest,
-    SourceRecordRef, ToolAssociation, ToolName, TurnAssociation, TurnId, UnsupportedNativeRecord,
+    CallAssociation, ContextAssociation, ContextDigest, DecodedNativeRecord, InvocationAssociation,
+    InvocationDigest, KnownNativeRecord, NativeCallId, NativeRecordKind, Observation,
+    ObservationKind, OccurredAt, OutcomeAssociation, PayloadDigest, SourceRecordRef,
+    ToolAssociation, ToolName, ToolOutcome, ToolPurpose, TurnAssociation, TurnId,
+    UnsupportedNativeRecord,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -51,6 +53,8 @@ pub fn decode_codex_line(
             let turn = turn_association(&envelope.payload, sequence)?;
             let call = call_association(&envelope.payload, sequence)?;
             let tool = tool_association(kind, payload_type, &envelope.payload, sequence)?;
+            let invocation = invocation_association(kind, payload_type, &envelope.payload);
+            let outcome = outcome_association(kind, payload_type, &envelope.payload);
             Ok(DecodedNativeRecord::Known(KnownNativeRecord::new(
                 Observation::new(
                     source,
@@ -61,6 +65,8 @@ pub fn decode_codex_line(
                     turn,
                     call,
                     tool,
+                    invocation,
+                    outcome,
                 ),
             )))
         }
@@ -213,6 +219,175 @@ fn tool_association(
             .map(ToolAssociation::Tool)
             .map_err(|source| ProtocolError::InvalidDomainValue { sequence, source })
     })
+}
+
+fn invocation_association(
+    kind: ObservationKind,
+    payload_type: Option<&str>,
+    payload: &Value,
+) -> InvocationAssociation {
+    if kind != ObservationKind::ToolRequested {
+        return InvocationAssociation::NotApplicable;
+    }
+    let tool_name = string_field(payload, "name")
+        .or(payload_type)
+        .unwrap_or("unknown");
+    let raw_input = string_field(payload, "arguments")
+        .or_else(|| string_field(payload, "input"))
+        .unwrap_or("");
+    let mut fingerprint = Vec::with_capacity(tool_name.len() + raw_input.len() + 1);
+    fingerprint.extend_from_slice(tool_name.as_bytes());
+    fingerprint.push(0);
+    fingerprint.extend_from_slice(raw_input.as_bytes());
+    let purpose = classify_tool_purpose(tool_name, raw_input);
+    InvocationAssociation::Classified {
+        digest: InvocationDigest::hash(&fingerprint),
+        purpose,
+    }
+}
+
+fn classify_tool_purpose(tool_name: &str, raw_input: &str) -> ToolPurpose {
+    let tool_name = tool_name.to_ascii_lowercase();
+    if matches!(
+        tool_name.as_str(),
+        "apply_patch" | "write_file" | "edit_file"
+    ) {
+        return ToolPurpose::Modify;
+    }
+    if tool_name.contains("search") {
+        return ToolPurpose::Search;
+    }
+    if matches!(tool_name.as_str(), "read_file" | "list_files") {
+        return ToolPurpose::Inspect;
+    }
+    if tool_name != "exec_command" {
+        return ToolPurpose::Ambiguous;
+    }
+
+    let command = extract_command(raw_input).to_ascii_lowercase();
+    if contains_command(
+        &command,
+        &["rm ", "rm\t", "git reset", "drop database", "truncate "],
+    ) {
+        ToolPurpose::Destructive
+    } else if contains_command(&command, &["sudo ", "doas ", "pkexec "]) {
+        ToolPurpose::PermissionEscalation
+    } else if contains_command(
+        &command,
+        &[
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "cargo fmt",
+            "pytest",
+            "pnpm test",
+            "npm test",
+            "typecheck",
+            "--version",
+        ],
+    ) {
+        ToolPurpose::Verify
+    } else if contains_command(
+        &command,
+        &[
+            "cargo install",
+            "brew install",
+            "apt install",
+            "npm install",
+            "pnpm add",
+        ],
+    ) {
+        ToolPurpose::Install
+    } else if contains_command(
+        &command,
+        &["rg ", "grep ", "find ", "git grep", "fd ", "ripgrep"],
+    ) {
+        ToolPurpose::Search
+    } else if contains_command(
+        &command,
+        &[
+            "ls ",
+            "cat ",
+            "sed ",
+            "head ",
+            "tail ",
+            "git status",
+            "git diff",
+            "git log",
+            "wc ",
+            "file ",
+            "stat ",
+        ],
+    ) {
+        ToolPurpose::Inspect
+    } else if contains_command(&command, &["mkdir ", "mv ", "cp ", "chmod ", "touch "]) {
+        ToolPurpose::Modify
+    } else if contains_command(&command, &["curl ", "wget ", "ssh ", "scp "]) {
+        ToolPurpose::NetworkAccess
+    } else {
+        ToolPurpose::Execute
+    }
+}
+
+fn extract_command(raw_input: &str) -> String {
+    serde_json::from_str::<Value>(raw_input)
+        .ok()
+        .and_then(|value| value.get("cmd").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| raw_input.to_owned())
+}
+
+fn contains_command(command: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        command.starts_with(needle)
+            || command.contains(&format!(" {needle}"))
+            || command.contains(&format!(";{needle}"))
+            || command.contains(&format!("|{needle}"))
+            || command.contains(&format!("&&{needle}"))
+    })
+}
+
+fn outcome_association(
+    kind: ObservationKind,
+    payload_type: Option<&str>,
+    payload: &Value,
+) -> OutcomeAssociation {
+    if !matches!(
+        kind,
+        ObservationKind::ToolCompleted
+            | ObservationKind::CommandCompleted
+            | ObservationKind::PatchApplied
+    ) {
+        return OutcomeAssociation::NotApplicable;
+    }
+    if let Some(success) = payload.get("success").and_then(Value::as_bool) {
+        return OutcomeAssociation::Tool(if success {
+            ToolOutcome::Succeeded
+        } else {
+            ToolOutcome::Failed
+        });
+    }
+    if let Some(exit_code) = payload.get("exit_code").and_then(Value::as_i64) {
+        return OutcomeAssociation::Tool(if exit_code == 0 {
+            ToolOutcome::Succeeded
+        } else {
+            ToolOutcome::Failed
+        });
+    }
+    if let Some(output) = string_field(payload, "output") {
+        if output.contains("Process exited with code 0") {
+            return OutcomeAssociation::Tool(ToolOutcome::Succeeded);
+        }
+        if output.contains("Process exited with code ") {
+            return OutcomeAssociation::Tool(ToolOutcome::Failed);
+        }
+    }
+    if matches!(
+        payload_type,
+        Some("custom_tool_call_output" | "patch_apply_end")
+    ) {
+        return OutcomeAssociation::Tool(ToolOutcome::Succeeded);
+    }
+    OutcomeAssociation::Tool(ToolOutcome::Indeterminate)
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {

@@ -36,4 +36,11 @@ pub enum DomainError {
     /// A graph namespace contained unsupported characters.
     #[error("graph namespace may contain only ASCII letters, digits, hyphen, and underscore")]
     InvalidGraphNamespace,
+
+    /// A semantic collection that must contain evidence was empty.
+    #[error("{field} must contain at least one item")]
+    EmptyCollection {
+        /// Semantic collection name.
+        field: &'static str,
+    },
 }

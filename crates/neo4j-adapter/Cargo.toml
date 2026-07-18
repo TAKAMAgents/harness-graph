@@ -18,7 +18,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 dotenvy.workspace = true
+harness-graph-assurance = { path = "../assurance" }
+harness-graph-classification = { path = "../classification" }
+harness-graph-correlation = { path = "../correlation" }
 harness-graph-ingestion = { path = "../ingestion" }
+harness-graph-path-analysis = { path = "../path-analysis" }
+harness-graph-risk = { path = "../risk" }
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true

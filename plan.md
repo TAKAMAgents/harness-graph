@@ -1484,12 +1484,22 @@ Deliver:
 ```text
 621 canonical raw records
       ↓
-roughly 15 to 25 meaningful activities
+deterministic, evidence-preserving semantic episodes
+      ↓
+Mistral macro-summary of roughly 15 to 25 narrative activities
 ```
+
+The deterministic episode count is source- and behavior-dependent, not a fixed
+acceptance threshold. The current 621-record golden snapshot produces 56
+stable episodes from 89 native-ID tool calls. Further compression into roughly
+15 to 25 items belongs to the Mistral interpretation layer and must not erase,
+merge, or rewrite the underlying evidence graph.
 
 Exit criterion:
 
 ```text
+the deterministic episode sequence and path signature are stable on re-import
+every macro-summary item cites one or more deterministic activity IDs
 Inspect
 → ExecuteFailed
 → AdaptEnvironment
@@ -1724,14 +1734,14 @@ OpenCode begins working and the graph grows live.
 [x] No serde_json::Value escapes the protocol boundary.
 [x] Every domain ID is a distinct newtype.
 [ ] Every graph edge has an allowed source and target type.
-[ ] Tool calls and results correlate by native ID.
-[ ] Pending, interrupted, and orphaned tool-call states are preserved.
-[ ] Low-level events become semantic activities.
-[ ] Neo4j reconstructs the full execution path.
+[x] Tool calls and results correlate by native ID.
+[x] Pending, interrupted, and orphaned tool-call states are preserved.
+[x] Low-level events become semantic activities.
+[x] Neo4j reconstructs the full execution path.
 [x] Neo4j projection uses uniqueness constraints, bounded batches, and checkpoints.
 [ ] The UI shows timeline, graph, context, and assurance.
-[ ] Outcomes are determined from evidence.
-[ ] Risks link to concrete supporting observations.
+[x] Outcomes are determined from evidence.
+[x] Risks link to concrete supporting observations.
 [ ] Paths store time, cost, correctness, and uncertainty.
 [ ] Pathfinder uses typed tools rather than raw Cypher.
 [ ] Candidate plans cite supporting runs.

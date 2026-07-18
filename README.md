@@ -38,6 +38,13 @@ Inspect a verified bundle without touching Neo4j:
 cargo run -p harness-graph-cli -- inspect --session-id <uuid>
 ```
 
+Derive correlations, semantic activities, evidence assurance, risks, and a
+content-addressed path without mutating Neo4j:
+
+```bash
+cargo run -p harness-graph-cli -- analyze --session-id <uuid>
+```
+
 Project it into Neo4j:
 
 ```bash
@@ -52,10 +59,17 @@ digest and sequence. `HARNESS_GRAPH_NAMESPACE` isolates graph populations and
 `HARNESS_GRAPH_BATCH_SIZE` controls the validated transaction bound.
 
 The current projection stores source/session provenance, observations,
-quarantined variants, content-addressed contexts, turns, tool calls, tools, and
-ingestion receipts. Semantic activities, assurance/risk findings, path
-profiles, and visualization are subsequent vertical slices tracked in
-[`plan.md`](plan.md).
+quarantined variants, content-addressed contexts, turns, native-ID-correlated
+tool calls, tools, compressed semantic activities, evidence-derived outcomes,
+risk findings, normalized execution paths, and ingestion receipts. Every
+derived finding retains source-record evidence links. Visualization, aggregate
+path profiles, and Mistral-backed planning remain subsequent vertical slices
+tracked in [`plan.md`](plan.md).
+
+The verified 621-record golden snapshot currently derives 89 completed tool
+calls and 56 deterministic semantic episodes. These are evidence-preserving
+episodes, not the later 15–25-item Mistral narrative summary; both layers have
+separate contracts in the plan.
 
 ## Development commands
 

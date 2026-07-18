@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContextDigest, NativeCallId, NativeRecordKind, OccurredAt, PayloadDigest, RecordSequence,
-    SessionId, SourceDigest, ToolName, TurnId,
+    ContextDigest, InvocationAssociation, NativeCallId, NativeRecordKind, OccurredAt,
+    OutcomeAssociation, PayloadDigest, RecordSequence, SessionId, SourceDigest, ToolName, TurnId,
 };
 
 /// Stable provenance for one line in a verified canonical rollout.
@@ -184,6 +184,8 @@ pub struct Observation {
     turn: TurnAssociation,
     call: CallAssociation,
     tool: ToolAssociation,
+    invocation: InvocationAssociation,
+    outcome: OutcomeAssociation,
 }
 
 impl Observation {
@@ -199,6 +201,8 @@ impl Observation {
         turn: TurnAssociation,
         call: CallAssociation,
         tool: ToolAssociation,
+        invocation: InvocationAssociation,
+        outcome: OutcomeAssociation,
     ) -> Self {
         Self {
             source,
@@ -209,6 +213,8 @@ impl Observation {
             turn,
             call,
             tool,
+            invocation,
+            outcome,
         }
     }
 
@@ -258,6 +264,18 @@ impl Observation {
     #[must_use]
     pub const fn tool(&self) -> &ToolAssociation {
         &self.tool
+    }
+
+    /// Source-safe invocation semantics, when this is a tool request.
+    #[must_use]
+    pub const fn invocation(&self) -> InvocationAssociation {
+        self.invocation
+    }
+
+    /// Structured result semantics, when this is a tool result.
+    #[must_use]
+    pub const fn outcome(&self) -> OutcomeAssociation {
+        self.outcome
     }
 }
 
@@ -366,4 +384,17 @@ pub enum ToolCallLifecycle {
         /// Native call identity.
         call_id: NativeCallId,
     },
+}
+
+impl ToolCallLifecycle {
+    /// Stable graph representation of the lifecycle state.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending { .. } => "pending",
+            Self::Completed { .. } => "completed",
+            Self::Interrupted { .. } => "interrupted",
+            Self::OrphanedResult { .. } => "orphaned_result",
+        }
+    }
 }

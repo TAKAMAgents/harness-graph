@@ -59,6 +59,10 @@ macro_rules! digest_type {
 digest_type!(SourceDigest, "source");
 digest_type!(PayloadDigest, "payload");
 digest_type!(ContextDigest, "context");
+digest_type!(InvocationDigest, "tool invocation");
+digest_type!(ActivityId, "semantic activity");
+digest_type!(RiskId, "risk exposure");
+digest_type!(PathSignature, "execution path");
 
 #[cfg(test)]
 mod tests {

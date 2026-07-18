@@ -2,12 +2,13 @@
 
 use async_trait::async_trait;
 use harness_graph_domain::{
-    CallAssociation, ContextAssociation, DecodedNativeRecord, GraphNamespace, ObservationId,
+    ActivityInvocation, CallAssociation, ContextAssociation, CorrelatedInvocation,
+    CorrelatedOutcome, CorrelatedPurpose, DecodedNativeRecord, GraphNamespace, ObservationId,
     ObservationKind, RecordCount, SessionId, SourceDigest, ToolAssociation, TurnAssociation,
 };
 use harness_graph_graph_port::{
-    FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector, ProjectionReceipt,
-    SourceSnapshotCommand,
+    AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector,
+    ProjectionReceipt, SourceSnapshotCommand,
 };
 use neo4rs::{Graph, Query, query};
 use secrecy::{ExposeSecret, SecretString};
@@ -60,6 +61,15 @@ pub enum Neo4jAdapterError {
 #[derive(Clone)]
 pub struct Neo4jAdapter {
     graph: Graph,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct AnalysisEntityCounts {
+    activities: RecordCount,
+    outcomes: RecordCount,
+    risks: RecordCount,
+    paths: RecordCount,
 }
 
 impl Neo4jAdapter {
@@ -169,6 +179,59 @@ impl Neo4jAdapter {
                 field: "completed_at",
             })
     }
+
+    #[cfg(test)]
+    async fn analysis_entity_counts(
+        &self,
+        namespace: &GraphNamespace,
+    ) -> Result<AnalysisEntityCounts, Neo4jAdapterError> {
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "OPTIONAL MATCH (a:HGActivity {hg_namespace: $namespace}) \
+                     WITH collect(DISTINCT a) AS activities \
+                     OPTIONAL MATCH (o:HGOutcome {hg_namespace: $namespace}) \
+                     WITH activities, collect(DISTINCT o) AS outcomes \
+                     OPTIONAL MATCH (r:HGRiskExposure {hg_namespace: $namespace}) \
+                     WITH activities, outcomes, collect(DISTINCT r) AS risks \
+                     OPTIONAL MATCH (p:HGPathPattern {hg_namespace: $namespace}) \
+                     RETURN size(activities) AS activities, size(outcomes) AS outcomes, \
+                            size(risks) AS risks, count(DISTINCT p) AS paths",
+                )
+                .param("namespace", namespace.as_str()),
+            )
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "count analysis entities",
+                source,
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|source| Neo4jAdapterError::Operation {
+                operation: "read analysis entity counts",
+                source,
+            })?
+            .ok_or(Neo4jAdapterError::InvalidReadResult {
+                field: "analysis entity counts",
+            })?;
+        Ok(AnalysisEntityCounts {
+            activities: read_count(&row, "activities")?,
+            outcomes: read_count(&row, "outcomes")?,
+            risks: read_count(&row, "risks")?,
+            paths: read_count(&row, "paths")?,
+        })
+    }
+}
+
+#[cfg(test)]
+fn read_count(row: &neo4rs::Row, field: &'static str) -> Result<RecordCount, Neo4jAdapterError> {
+    let count: i64 = row
+        .get(field)
+        .map_err(|_| Neo4jAdapterError::InvalidReadResult { field })?;
+    let count = u64::try_from(count).map_err(|_| Neo4jAdapterError::IntegerRange { field })?;
+    Ok(RecordCount::new(count))
 }
 
 #[async_trait]
@@ -259,6 +322,10 @@ fn constraints() -> &'static [&'static str] {
         "CREATE CONSTRAINT hg_call_key IF NOT EXISTS FOR (n:HGToolCall) REQUIRE n.key IS UNIQUE",
         "CREATE CONSTRAINT hg_tool_key IF NOT EXISTS FOR (n:HGTool) REQUIRE n.key IS UNIQUE",
         "CREATE CONSTRAINT hg_receipt_key IF NOT EXISTS FOR (n:HGIngestionReceipt) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT hg_activity_key IF NOT EXISTS FOR (n:HGActivity) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT hg_outcome_key IF NOT EXISTS FOR (n:HGOutcome) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT hg_risk_key IF NOT EXISTS FOR (n:HGRiskExposure) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT hg_path_key IF NOT EXISTS FOR (n:HGPathPattern) REQUIRE n.key IS UNIQUE",
     ]
 }
 
@@ -269,6 +336,7 @@ fn command_queries(command: GraphCommand) -> Result<Vec<Query>, Neo4jAdapterErro
             observation_queries(&namespace, record)
         }
         GraphCommand::FinalizeIngestion(command) => finalize_queries(&command),
+        GraphCommand::UpsertAnalysis(command) => analysis_queries(&command),
     }
 }
 
@@ -577,6 +645,256 @@ fn finalize_queries(command: &FinalizeIngestionCommand) -> Result<Vec<Query>, Ne
     ])
 }
 
+fn analysis_queries(command: &AnalysisProjectionCommand) -> Result<Vec<Query>, Neo4jAdapterError> {
+    let mut queries = Vec::new();
+    append_correlation_queries(&mut queries, command);
+    append_activity_queries(&mut queries, command)?;
+    append_outcome_queries(&mut queries, command);
+    append_risk_queries(&mut queries, command);
+    append_path_query(&mut queries, command)?;
+    Ok(queries)
+}
+
+fn append_correlation_queries(queries: &mut Vec<Query>, command: &AnalysisProjectionCommand) {
+    let namespace = command.namespace().as_str();
+    let session_id = command.session_id().to_string();
+    for correlation in command.report().correlations().iter() {
+        let purpose = match correlation.purpose() {
+            CorrelatedPurpose::Unknown => "unknown",
+            CorrelatedPurpose::Known(purpose) => purpose.as_str(),
+        };
+        let invocation_digest = match correlation.invocation() {
+            CorrelatedInvocation::Unknown => String::new(),
+            CorrelatedInvocation::Known(digest) => digest.to_hex(),
+        };
+        let outcome = match correlation.outcome() {
+            CorrelatedOutcome::Missing => "missing",
+            CorrelatedOutcome::Known(outcome) => outcome.as_str(),
+        };
+        queries.push(
+            query(
+                "MERGE (c:HGToolCall {key: $call_key}) \
+                 ON CREATE SET c.hg_namespace = $namespace, c.call_id = $call_id \
+                 SET c.state = $state, c.purpose = $purpose, \
+                     c.invocation_digest = $invocation_digest, c.outcome = $outcome",
+            )
+            .param(
+                "call_key",
+                call_key(namespace, &session_id, correlation.call_id().as_str()),
+            )
+            .param("namespace", namespace)
+            .param("call_id", correlation.call_id().as_str())
+            .param("state", correlation.lifecycle().as_str())
+            .param("purpose", purpose)
+            .param("invocation_digest", invocation_digest)
+            .param("outcome", outcome),
+        );
+    }
+}
+
+fn append_activity_queries(
+    queries: &mut Vec<Query>,
+    command: &AnalysisProjectionCommand,
+) -> Result<(), Neo4jAdapterError> {
+    let namespace = command.namespace().as_str();
+    let source_digest = command.source_digest().to_hex();
+    let mut previous_activity_key = None;
+    for activity in command.report().activities().iter() {
+        let activity_id = activity.id().to_hex();
+        let current_activity_key = activity_key(namespace, &activity_id);
+        let invocation_digest = match activity.invocation() {
+            ActivityInvocation::NotApplicable | ActivityInvocation::Unknown => String::new(),
+            ActivityInvocation::Known(digest) => digest.to_hex(),
+        };
+        queries.push(
+            query(
+                "MATCH (src:HGSourceSnapshot {key: $source_key}) \
+                 MERGE (a:HGActivity {key: $activity_key}) \
+                 ON CREATE SET a.hg_namespace = $namespace, a.activity_id = $activity_id \
+                 SET a.kind = $kind, a.status = $status, \
+                     a.invocation_digest = $invocation_digest, \
+                     a.first_sequence = $first_sequence, a.last_sequence = $last_sequence, \
+                     a.evidence_count = $evidence_count, a.analysis_version = 1 \
+                 MERGE (src)-[:HAS_ACTIVITY]->(a)",
+            )
+            .param("source_key", source_key(namespace, &source_digest))
+            .param("activity_key", current_activity_key.clone())
+            .param("namespace", namespace)
+            .param("activity_id", activity_id)
+            .param("kind", activity.kind().as_str())
+            .param("status", activity.status().as_str())
+            .param("invocation_digest", invocation_digest)
+            .param(
+                "first_sequence",
+                to_i64(
+                    activity.evidence().first().sequence().value(),
+                    "activity first sequence",
+                )?,
+            )
+            .param(
+                "last_sequence",
+                to_i64(
+                    activity.evidence().last().sequence().value(),
+                    "activity last sequence",
+                )?,
+            )
+            .param(
+                "evidence_count",
+                to_i64(
+                    activity.evidence().count().value(),
+                    "activity evidence count",
+                )?,
+            ),
+        );
+        for evidence in activity.evidence().iter() {
+            let observation_id =
+                ObservationId::from_source(evidence.source_digest(), evidence.sequence());
+            queries.push(
+                query(
+                    "MATCH (o:HGObservation {key: $observation_key}) \
+                     MATCH (a:HGActivity {key: $activity_key}) \
+                     MERGE (o)-[:EVIDENCE_FOR]->(a)",
+                )
+                .param(
+                    "observation_key",
+                    observation_key(namespace, observation_id.as_str()),
+                )
+                .param("activity_key", current_activity_key.clone()),
+            );
+        }
+        if let Some(previous_activity_key) = previous_activity_key {
+            queries.push(
+                query(
+                    "MATCH (previous:HGActivity {key: $previous_key}) \
+                     MATCH (current:HGActivity {key: $current_key}) \
+                     MERGE (previous)-[:NEXT_ACTIVITY]->(current)",
+                )
+                .param("previous_key", previous_activity_key)
+                .param("current_key", current_activity_key.clone()),
+            );
+        }
+        previous_activity_key = Some(current_activity_key);
+    }
+    Ok(())
+}
+
+fn append_outcome_queries(queries: &mut Vec<Query>, command: &AnalysisProjectionCommand) {
+    let namespace = command.namespace().as_str();
+    let source_digest = command.source_digest().to_hex();
+    let outcome = command.report().outcome();
+    let outcome_key = outcome_key(namespace, &source_digest);
+    queries.push(
+        query(
+            "MATCH (src:HGSourceSnapshot {key: $source_key}) \
+             MERGE (outcome:HGOutcome {key: $outcome_key}) \
+             ON CREATE SET outcome.hg_namespace = $namespace, outcome.source_digest = $source_digest \
+             SET outcome.class = $class, outcome.verification = $verification, \
+                 outcome.analysis_version = 1 \
+             MERGE (src)-[:HAS_OUTCOME]->(outcome)",
+        )
+        .param("source_key", source_key(namespace, &source_digest))
+        .param("outcome_key", outcome_key.clone())
+        .param("namespace", namespace)
+        .param("source_digest", source_digest)
+        .param("class", outcome.class().as_str())
+        .param("verification", outcome.verification().as_str()),
+    );
+    for evidence in outcome.evidence().iter() {
+        let observation_id =
+            ObservationId::from_source(evidence.source_digest(), evidence.sequence());
+        queries.push(
+            query(
+                "MATCH (o:HGObservation {key: $observation_key}) \
+                 MATCH (outcome:HGOutcome {key: $outcome_key}) \
+                 MERGE (o)-[:EVIDENCE_FOR]->(outcome)",
+            )
+            .param(
+                "observation_key",
+                observation_key(namespace, observation_id.as_str()),
+            )
+            .param("outcome_key", outcome_key.clone()),
+        );
+    }
+}
+
+fn append_risk_queries(queries: &mut Vec<Query>, command: &AnalysisProjectionCommand) {
+    let namespace = command.namespace().as_str();
+    let source_digest = command.source_digest().to_hex();
+    for risk in command.report().risks().iter() {
+        let risk_key = risk_key(namespace, &risk.id().to_hex());
+        queries.push(
+            query(
+                "MATCH (src:HGSourceSnapshot {key: $source_key}) \
+                 MERGE (risk:HGRiskExposure {key: $risk_key}) \
+                 ON CREATE SET risk.hg_namespace = $namespace, risk.risk_id = $risk_id \
+                 SET risk.hazard = $hazard, risk.severity = $severity, risk.analysis_version = 1 \
+                 MERGE (src)-[:HAS_RISK]->(risk)",
+            )
+            .param("source_key", source_key(namespace, &source_digest))
+            .param("risk_key", risk_key.clone())
+            .param("namespace", namespace)
+            .param("risk_id", risk.id().to_hex())
+            .param("hazard", risk.hazard().as_str())
+            .param("severity", risk.severity().as_str()),
+        );
+        for evidence in risk.evidence().iter() {
+            let observation_id =
+                ObservationId::from_source(evidence.source_digest(), evidence.sequence());
+            queries.push(
+                query(
+                    "MATCH (o:HGObservation {key: $observation_key}) \
+                     MATCH (risk:HGRiskExposure {key: $risk_key}) \
+                     MERGE (o)-[:EVIDENCE_FOR]->(risk)",
+                )
+                .param(
+                    "observation_key",
+                    observation_key(namespace, observation_id.as_str()),
+                )
+                .param("risk_key", risk_key.clone()),
+            );
+        }
+    }
+}
+
+fn append_path_query(
+    queries: &mut Vec<Query>,
+    command: &AnalysisProjectionCommand,
+) -> Result<(), Neo4jAdapterError> {
+    let namespace = command.namespace().as_str();
+    let source_digest = command.source_digest().to_hex();
+    let path = command.report().path();
+    let signature = path.signature().to_hex();
+    let mut compact = String::new();
+    for step in path.steps().iter() {
+        if !compact.is_empty() {
+            compact.push('>');
+        }
+        compact.push_str(step.kind().as_str());
+        compact.push(':');
+        compact.push_str(step.status().as_str());
+    }
+    queries.push(
+        query(
+            "MATCH (src:HGSourceSnapshot {key: $source_key}) \
+             MERGE (path:HGPathPattern {key: $path_key}) \
+             ON CREATE SET path.hg_namespace = $namespace, path.signature = $signature, \
+                           path.compact = $compact, path.step_count = $step_count, \
+                           path.analysis_version = 1 \
+             MERGE (src)-[:FOLLOWED_PATH]->(path)",
+        )
+        .param("source_key", source_key(namespace, &source_digest))
+        .param("path_key", path_key(namespace, &signature))
+        .param("namespace", namespace)
+        .param("signature", signature)
+        .param("compact", compact)
+        .param(
+            "step_count",
+            to_i64(path.steps().count().value(), "path step count")?,
+        ),
+    );
+    Ok(())
+}
+
 fn to_i64(value: impl TryInto<i64>, field: &'static str) -> Result<i64, Neo4jAdapterError> {
     value
         .try_into()
@@ -615,15 +933,39 @@ fn receipt_key(namespace: &str, source_digest: &str) -> String {
     format!("{namespace}:receipt:{source_digest}")
 }
 
+fn activity_key(namespace: &str, activity_id: &str) -> String {
+    format!("{namespace}:activity:{activity_id}")
+}
+
+fn outcome_key(namespace: &str, source_digest: &str) -> String {
+    format!("{namespace}:outcome:{source_digest}")
+}
+
+fn risk_key(namespace: &str, risk_id: &str) -> String {
+    format!("{namespace}:risk:{risk_id}")
+}
+
+fn path_key(namespace: &str, signature: &str) -> String {
+    format!("{namespace}:path:{signature}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, path::PathBuf};
 
-    use harness_graph_domain::{DecodedNativeRecord, GraphNamespace, RecordCount, SessionId};
+    use harness_graph_assurance::assess_outcome;
+    use harness_graph_classification::ActivityBuilder;
+    use harness_graph_correlation::CorrelationEngine;
+    use harness_graph_domain::{
+        AnalysisReport, DecodedNativeRecord, GraphNamespace, RecordCount, SessionId,
+    };
     use harness_graph_graph_port::{
-        FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector, SourceSnapshotCommand,
+        AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand,
+        GraphProjector, SourceSnapshotCommand,
     };
     use harness_graph_ingestion::{ArchiveRoot, DecodedRecordStream, SessionScope};
+    use harness_graph_path_analysis::derive_path;
+    use harness_graph_risk::RiskEngine;
     use secrecy::SecretString;
     use url::Url;
 
@@ -673,6 +1015,12 @@ mod tests {
         let records = records?;
         project_records(adapter, namespace, records.clone()).await?;
 
+        let analysis = analyze_records(&records)?;
+        let analysis_command =
+            AnalysisProjectionCommand::new(namespace.clone(), session_id, source_digest, analysis);
+        project_analysis(adapter, analysis_command.clone()).await?;
+        project_analysis(adapter, analysis_command).await?;
+
         let receipt = FinalizeIngestionCommand::new(
             namespace.clone(),
             session_id,
@@ -692,7 +1040,53 @@ mod tests {
             .receipt_completed_at(namespace, source_digest)
             .await?;
         assert_eq!(adapter.observation_count(namespace).await?.value(), 12);
+        assert_eq!(
+            adapter.analysis_entity_counts(namespace).await?,
+            super::AnalysisEntityCounts {
+                activities: RecordCount::new(4),
+                outcomes: RecordCount::new(1),
+                risks: RecordCount::new(2),
+                paths: RecordCount::new(1),
+            }
+        );
         assert_eq!(first_completed_at, second_completed_at);
+        Ok(())
+    }
+
+    fn analyze_records(
+        records: &[DecodedNativeRecord],
+    ) -> Result<AnalysisReport, Box<dyn std::error::Error>> {
+        let mut correlations = CorrelationEngine::default();
+        let mut activities = ActivityBuilder::default();
+        let mut risks = RiskEngine::default();
+        for record in records {
+            risks.observe(record);
+            if let DecodedNativeRecord::Known(known) = record {
+                correlations.observe(known.observation())?;
+                activities.observe(known.observation())?;
+            }
+        }
+        let correlations = correlations.finish()?;
+        let activities = activities.finish(&correlations)?;
+        let outcome = assess_outcome(&activities)?;
+        let risks = risks.finish(&activities, &correlations, &outcome)?;
+        let path = derive_path(&activities)?;
+        Ok(AnalysisReport::new(
+            correlations,
+            activities,
+            outcome,
+            risks,
+            path,
+        ))
+    }
+
+    async fn project_analysis(
+        adapter: &Neo4jAdapter,
+        analysis: AnalysisProjectionCommand,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        adapter
+            .project(GraphBatch::first(GraphCommand::UpsertAnalysis(analysis)))
+            .await?;
         Ok(())
     }
 

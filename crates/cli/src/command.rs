@@ -1,14 +1,22 @@
 //! CLI command parsing and orchestration.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use harness_graph_domain::{DecodedNativeRecord, RecordCount, SessionId};
+use harness_graph_assurance::assess_outcome;
+use harness_graph_classification::ActivityBuilder;
+use harness_graph_correlation::CorrelationEngine;
+use harness_graph_domain::{
+    AnalysisReport, DecodedNativeRecord, RecordCount, SessionId, ToolCallLifecycle,
+};
 use harness_graph_graph_port::{
-    FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector, SourceSnapshotCommand,
+    AnalysisProjectionCommand, FinalizeIngestionCommand, GraphBatch, GraphCommand, GraphProjector,
+    SourceSnapshotCommand,
 };
 use harness_graph_ingestion::{
     DecodedRecordStream, IngestionError, SessionScope, SourceKind, inspect_bundle,
 };
 use harness_graph_neo4j_adapter::Neo4jAdapter;
+use harness_graph_path_analysis::derive_path;
+use harness_graph_risk::RiskEngine;
 use secrecy::SecretString;
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -30,6 +38,7 @@ pub async fn run() -> Result<(), CliError> {
         Command::Discover { scope, limit } => discover(&config, scope.into(), limit),
         Command::Verify { session_id } => verify(&config, &session_id),
         Command::Inspect { session_id } => inspect(&config, &session_id),
+        Command::Analyze { session_id } => analyze(&config, &session_id),
         Command::Import { session_id } => import(&config, &session_id).await,
     }
 }
@@ -66,6 +75,12 @@ enum Command {
     },
     /// Stream and type every canonical record in one verified session.
     Inspect {
+        /// Stable session UUID.
+        #[arg(long)]
+        session_id: String,
+    },
+    /// Derive source-safe correlations, activities, outcome, risks, and path.
+    Analyze {
         /// Stable session UUID.
         #[arg(long)]
         session_id: String,
@@ -210,6 +225,86 @@ struct ImportOutput {
     quarantined_records: u64,
     total_records: u64,
     observations_in_namespace: u64,
+    analysis: AnalysisOutput,
+}
+
+#[derive(Serialize)]
+struct AnalysisOutput {
+    tool_calls: u64,
+    completed_tool_calls: u64,
+    pending_tool_calls: u64,
+    interrupted_tool_calls: u64,
+    orphaned_tool_results: u64,
+    semantic_activities: u64,
+    outcome_class: &'static str,
+    verification_status: &'static str,
+    risk_exposures: u64,
+    path_signature: String,
+    path_steps: u64,
+}
+
+#[derive(Serialize)]
+struct AnalyzeOutput {
+    status: &'static str,
+    session_id: String,
+    source_digest: String,
+    analysis: AnalysisOutput,
+}
+
+#[derive(Debug, Default)]
+struct AnalysisAccumulator {
+    correlations: CorrelationEngine,
+    activities: ActivityBuilder,
+    risks: RiskEngine,
+}
+
+impl AnalysisAccumulator {
+    fn observe(&mut self, record: &DecodedNativeRecord) -> Result<(), CliError> {
+        self.risks.observe(record);
+        if let DecodedNativeRecord::Known(known) = record {
+            self.correlations.observe(known.observation())?;
+            self.activities.observe(known.observation())?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<AnalysisReport, CliError> {
+        let correlations = self.correlations.finish()?;
+        let activities = self.activities.finish(&correlations)?;
+        let outcome = assess_outcome(&activities)?;
+        let risks = self.risks.finish(&activities, &correlations, &outcome)?;
+        let path = derive_path(&activities)?;
+        Ok(AnalysisReport::new(
+            correlations,
+            activities,
+            outcome,
+            risks,
+            path,
+        ))
+    }
+}
+
+fn analyze(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
+    let session_id = SessionId::parse(session_id)?;
+    let catalog = config.archive_root().discover(SessionScope::All)?;
+    let verified = catalog.require(session_id)?.verify()?;
+    let source_digest = verified.source_digest();
+    let expected_records = verified.expected_records();
+    let mut total_records = RecordCount::default();
+    let mut accumulator = AnalysisAccumulator::default();
+    for record in DecodedRecordStream::open(verified)? {
+        let record = record?;
+        accumulator.observe(&record)?;
+        total_records.increment();
+    }
+    validate_record_count(expected_records, total_records)?;
+    let report = accumulator.finish()?;
+    write_json(&AnalyzeOutput {
+        status: "analyzed",
+        session_id: session_id.to_string(),
+        source_digest: source_digest.to_hex(),
+        analysis: summarize_analysis(&report),
+    })
 }
 
 enum PendingBatch {
@@ -248,9 +343,11 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     let mut known_records = RecordCount::default();
     let mut quarantined_records = RecordCount::default();
     let mut total_records = RecordCount::default();
+    let mut analysis = AnalysisAccumulator::default();
     let mut pending = PendingBatch::Empty;
     for record in DecodedRecordStream::open(verified)? {
         let record = record?;
+        analysis.observe(&record)?;
         match &record {
             DecodedNativeRecord::Known(_) => known_records.increment(),
             DecodedNativeRecord::Unsupported(_) => quarantined_records.increment(),
@@ -271,13 +368,15 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
     if let PendingBatch::Building(batch) = pending {
         adapter.project(batch).await?;
     }
-    if total_records != expected_records {
-        return Err(IngestionError::RecordCountMismatch {
-            expected: expected_records,
-            actual: total_records,
-        }
-        .into());
-    }
+    validate_record_count(expected_records, total_records)?;
+
+    let report = analysis.finish()?;
+    let analysis_output = summarize_analysis(&report);
+    adapter
+        .project(GraphBatch::first(GraphCommand::UpsertAnalysis(
+            AnalysisProjectionCommand::new(namespace.clone(), session_id, source_digest, report),
+        )))
+        .await?;
 
     adapter
         .project(GraphBatch::first(GraphCommand::FinalizeIngestion(
@@ -300,7 +399,44 @@ async fn import(config: &AppConfig, session_id: &str) -> Result<(), CliError> {
         quarantined_records: quarantined_records.value(),
         total_records: total_records.value(),
         observations_in_namespace: observations_in_namespace.value(),
+        analysis: analysis_output,
     })
+}
+
+fn validate_record_count(expected: RecordCount, actual: RecordCount) -> Result<(), CliError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(IngestionError::RecordCountMismatch { expected, actual }.into())
+    }
+}
+
+fn summarize_analysis(report: &AnalysisReport) -> AnalysisOutput {
+    let mut completed = RecordCount::default();
+    let mut pending = RecordCount::default();
+    let mut interrupted = RecordCount::default();
+    let mut orphaned = RecordCount::default();
+    for correlation in report.correlations().iter() {
+        match correlation.lifecycle() {
+            ToolCallLifecycle::Completed { .. } => completed.increment(),
+            ToolCallLifecycle::Pending { .. } => pending.increment(),
+            ToolCallLifecycle::Interrupted { .. } => interrupted.increment(),
+            ToolCallLifecycle::OrphanedResult { .. } => orphaned.increment(),
+        }
+    }
+    AnalysisOutput {
+        tool_calls: report.correlations().count().value(),
+        completed_tool_calls: completed.value(),
+        pending_tool_calls: pending.value(),
+        interrupted_tool_calls: interrupted.value(),
+        orphaned_tool_results: orphaned.value(),
+        semantic_activities: report.activities().count().value(),
+        outcome_class: report.outcome().class().as_str(),
+        verification_status: report.outcome().verification().as_str(),
+        risk_exposures: report.risks().count().value(),
+        path_signature: report.path().signature().to_hex(),
+        path_steps: report.path().steps().count().value(),
+    }
 }
 
 async fn append_or_project(
